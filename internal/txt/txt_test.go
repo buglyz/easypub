@@ -115,12 +115,15 @@ func TestParse_PreservesFullWidthSpaceIndent(t *testing.T) {
 }
 
 func TestBuildSimplePattern(t *testing.T) {
-	p := buildSimplePattern(Options{
+	p, err := buildSimplePattern(Options{
 		SimpleRegP1:           "[第卷]",
 		SimpleRegP2:           0,
 		SimpleRegP3:           "[章回卷节集部]",
 		SimpleRegLeadingSpace: true,
 	})
+	if err != nil {
+		t.Fatalf("buildSimplePattern: %v", err)
+	}
 	if p == nil {
 		t.Fatal("buildSimplePattern 返回 nil")
 	}

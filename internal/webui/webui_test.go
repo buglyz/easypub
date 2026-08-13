@@ -7,8 +7,10 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -357,5 +359,53 @@ func TestNew_DefaultBindLocalhost(t *testing.T) {
 	}
 	if s.cfg.Addr != "127.0.0.1:8080" {
 		t.Errorf("默认 Addr=%s 期望 127.0.0.1:8080", s.cfg.Addr)
+	}
+}
+
+func TestHealthz_ReturnsOK(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d 期望 200", resp.StatusCode)
+	}
+	if !strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+		t.Errorf("Content-Type=%s 期望 json", resp.Header.Get("Content-Type"))
+	}
+}
+
+func TestCleanupOnce_RemovesExpiredFiles(t *testing.T) {
+	s := newTestServer(t)
+	// 写一个"过期" epub：改 mtime 到 2 天前。
+	p := filepath.Join(s.outputs, "20240101-000000-deadbeef.epub")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	old := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(p, old, old); err != nil {
+		t.Fatalf("Chtimes: %v", err)
+	}
+	// 再写一个新鲜 epub，不应被删。
+	fresh := filepath.Join(s.outputs, "20990101-000000-freshbeef.epub")
+	if err := os.WriteFile(fresh, []byte("y"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	s.cleanupOnce()
+
+	if _, err := os.Stat(p); !os.IsNotExist(err) {
+		t.Errorf("过期文件应被删除, err=%v", err)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("新鲜文件不应被删除, err=%v", err)
 	}
 }

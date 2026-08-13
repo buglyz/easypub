@@ -3,6 +3,7 @@
 package webui
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -11,9 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -29,6 +32,17 @@ const maxUploadBytes = 64 << 20
 
 // maxConcurrentConverts 限制同时进行的转换数，避免 kindlegen/大文件 OOM。
 const maxConcurrentConverts = 2
+
+// outputRetention 是生成产物的最长保留时间，超过即由后台清理删除。
+// 服务器长期运行下避免 .easypub-output/ 无限堆积撑满磁盘。
+const outputRetention = 24 * time.Hour
+
+// cleanupInterval 是后台清理的扫描周期。
+const cleanupInterval = 1 * time.Hour
+
+// shutdownTimeout 是收到 SIGTERM 后等待在途请求的最长时间，
+// 之后强制关闭连接。需小于容器编排的 kill grace(通常 30s)。
+const shutdownTimeout = 20 * time.Second
 
 // downloadNameRe 限制下载文件名格式，与 outPath 命名一致。
 var downloadNameRe = regexp.MustCompile(`^[0-9]{8}-[0-9]{6}-[0-9a-f]{8}\.(epub|mobi)$`)
@@ -69,19 +83,26 @@ func New(cfg Config) (*Server, error) {
 	}, nil
 }
 
-// Run 启动 HTTP 服务并阻塞(阻塞直至服务器被终止)。
+// Run 启动 HTTP 服务并阻塞，直至收到 SIGINT/SIGTERM 或发生致命错误。
+// 优雅关闭：收到信号后等待在途请求最多 shutdownTimeout，再强制断开。
+// 同时启动后台 goroutine 周期清理过期的输出产物，避免磁盘无限堆积。
 func (s *Server) Run() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.withSecurityHeaders(s.handleIndex))
 	mux.HandleFunc("/api/detect", s.withSecurityHeaders(s.handleDetect))
 	mux.HandleFunc("/api/convert", s.withSecurityHeaders(s.handleConvert))
 	mux.HandleFunc("/api/download/", s.withSecurityHeaders(s.handleDownload))
+	// 轻量探活端点，供容器 healthcheck / 反代 / 监控使用。不带安全头无妨。
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 
 	log.Printf("EasyPub WebUI 已启动: http://%s", s.cfg.Addr)
 	if s.cfg.Version != "" {
 		log.Printf("版本: %s", s.cfg.Version)
 	}
 	log.Printf("输出目录: %s", s.outputs)
+	log.Printf("产物保留 %s，每 %s 清理一次", outputRetention, cleanupInterval)
 	log.Printf("提示: 默认仅本机可访问；若需局域网访问请显式指定 -addr 0.0.0.0:8080 并注意无鉴权风险")
 
 	srv := &http.Server{
@@ -93,7 +114,72 @@ func (s *Server) Run() error {
 		IdleTimeout:       30 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
-	return srv.ListenAndServe()
+
+	// 后台周期清理过期产物。
+	cleanupCtx, cleanupCancel := context.WithCancel(context.Background())
+	defer cleanupCancel()
+	go s.cleanupLoop(cleanupCtx)
+
+	// 信号监听：SIGINT/SIGTERM 触发优雅关闭。
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	serverErr := make(chan error, 1)
+	go func() {
+		serverErr <- srv.ListenAndServe()
+	}()
+
+	select {
+	case err := <-serverErr:
+		return err
+	case sig := <-sigCh:
+		log.Printf("收到信号 %s，开始优雅关闭（最长等待 %s）", sig, shutdownTimeout)
+		cleanupCancel()
+		ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			return fmt.Errorf("优雅关闭失败: %w", err)
+		}
+		log.Printf("已关闭")
+		return nil
+	}
+}
+
+// cleanupLoop 周期扫描输出目录，删除超过 outputRetention 的 epub/mobi/临时 txt。
+// 下载是即时的，旧产物对用户无价值；长期运行下这是唯一的磁盘释放途径。
+func (s *Server) cleanupLoop(ctx context.Context) {
+	// 启动时先清理一次（可能在上次崩溃后残留）。
+	s.cleanupOnce()
+	t := time.NewTicker(cleanupInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.cleanupOnce()
+		}
+	}
+}
+
+// cleanupOnce 执行一轮清理。按 mtime 判断，删除过期文件。
+func (s *Server) cleanupOnce() {
+	entries, err := os.ReadDir(s.outputs)
+	if err != nil {
+		return
+	}
+	cutoff := time.Now().Add(-outputRetention)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		if info.ModTime().Before(cutoff) {
+			_ = os.Remove(filepath.Join(s.outputs, e.Name()))
+		}
+	}
 }
 
 // withSecurityHeaders 为所有响应附加安全头。

@@ -7,6 +7,7 @@
 //	easypub -i book.txt -o output.epub --config config.xml
 //	easypub -i book.txt -o output.epub --mobi
 //	easypub serve -addr :8080
+//	easypub health http://127.0.0.1:8080/healthz
 //	easypub -version
 //
 // 不带参数时打印帮助。
@@ -16,7 +17,9 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
+	"time"
 
 	"github.com/easypub/go-easypub/internal/converter"
 	"github.com/easypub/go-easypub/internal/webui"
@@ -26,16 +29,43 @@ import (
 var version = "dev"
 
 func main() {
-	if len(os.Args) > 1 && os.Args[1] == "serve" {
-		if err := serveCmd(os.Args[2:]); err != nil {
-			log.Printf("easypub serve: %v", err)
-			os.Exit(2)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "serve":
+			if err := serveCmd(os.Args[2:]); err != nil {
+				log.Printf("easypub serve: %v", err)
+				os.Exit(2)
+			}
+			return
+		case "health":
+			// 容器内探活：distroless 无 curl/wget，用二进制自身发起请求。
+			if err := healthCmd(os.Args[2:]); err != nil {
+				os.Exit(1)
+			}
+			return
 		}
-		return
 	}
 	if err := run(); err != nil {
 		log.Fatalf("easypub: %v", err)
 	}
+}
+
+// healthCmd 向指定 URL 发起 GET，2xx 视为健康，否则退出码 1。
+// 专供 Docker HEALTHCHECK / k8s liveness 使用。
+func healthCmd(args []string) error {
+	if len(args) == 0 {
+		return fmt.Errorf("缺少 URL 参数")
+	}
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Get(args[0])
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("状态码 %d", resp.StatusCode)
+	}
+	return nil
 }
 
 // serveCmd 启动 WebUI。
@@ -121,6 +151,7 @@ func printUsage() {
 	fmt.Fprintln(os.Stderr, "用法:")
 	fmt.Fprintln(os.Stderr, "  easypub -i <input.txt> [options]     转换 TXT→EPUB")
 	fmt.Fprintln(os.Stderr, "  easypub serve [-addr 127.0.0.1:8080] [-dir d] 启动 WebUI")
+	fmt.Fprintln(os.Stderr, "  easypub health <url>                  容器探活（GET url，2xx 健康）")
 	fmt.Fprintln(os.Stderr, "  easypub -version                      打印版本")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprintln(os.Stderr, "转换选项:")

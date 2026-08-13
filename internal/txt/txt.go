@@ -129,7 +129,10 @@ func Parse(text string, opt Options) ([]Chapter, error) {
 	}
 
 	// 构建章节切分正则集合。
-	pats := buildPatterns(opt)
+	pats, err := buildPatterns(opt)
+	if err != nil {
+		return nil, err
+	}
 
 	var marks []seg
 	for i, line := range lines {
@@ -180,15 +183,24 @@ func Parse(text string, opt Options) ([]Chapter, error) {
 	return chapters, nil
 }
 
-func buildPatterns(opt Options) []*regexp.Regexp {
+// buildPatterns 构建章节切分正则集合。
+// 用户显式提供的 FullReg / SimpleReg / AdditionalReg 若编译失败则返回 error，
+// 不再静默吞错回退到 AutoMark（否则用户填了无效正则却得到"整本一章"且无提示）。
+// DefaultRegExps 是内建常量，编译失败属编程错误，仍按原逻辑跳过。
+func buildPatterns(opt Options) ([]*regexp.Regexp, error) {
 	var pats []*regexp.Regexp
 	if opt.FullReg != "" {
-		if p, err := regexp.Compile(opt.FullReg); err == nil {
-			pats = append(pats, p)
+		p, err := regexp.Compile(opt.FullReg)
+		if err != nil {
+			return nil, fmt.Errorf("完整正则编译失败: %w", err)
 		}
+		pats = append(pats, p)
 	}
 	if opt.SimpleRegP1 != "" || opt.SimpleRegP3 != "" {
-		p := buildSimplePattern(opt)
+		p, err := buildSimplePattern(opt)
+		if err != nil {
+			return nil, err
+		}
 		if p != nil {
 			pats = append(pats, p)
 		}
@@ -197,9 +209,11 @@ func buildPatterns(opt Options) []*regexp.Regexp {
 		if s == "" {
 			continue
 		}
-		if p, err := regexp.Compile(s); err == nil {
-			pats = append(pats, p)
+		p, err := regexp.Compile(s)
+		if err != nil {
+			return nil, fmt.Errorf("附加正则编译失败: %w", err)
 		}
+		pats = append(pats, p)
 	}
 	if opt.AutoMark || len(pats) == 0 {
 		for _, s := range DefaultRegExps {
@@ -208,16 +222,16 @@ func buildPatterns(opt Options) []*regexp.Regexp {
 			}
 		}
 	}
-	return pats
+	return pats, nil
 }
 
 // buildSimplePattern 由简易三段式参数合成正则。
 // P1=前段字符类(如 [第卷])，P2=数字风格(0=阿拉伯,1=中文)，P3=尾段字符类(如 [章回卷节集部])。
 // SimpleRegExt 为附加在尾段后的扩展字符。
-func buildSimplePattern(opt Options) *regexp.Regexp {
+func buildSimplePattern(opt Options) (*regexp.Regexp, error) {
 	p1 := opt.SimpleRegP1
 	if p1 == "" {
-		return nil
+		return nil, nil
 	}
 	digits := "0123456789"
 	if opt.SimpleRegP2 == 1 {
@@ -234,9 +248,9 @@ func buildSimplePattern(opt Options) *regexp.Regexp {
 	expr := lead + `^\s*` + p1 + "[" + digits + "]+" + p3 + `.*`
 	p, err := regexp.Compile(expr)
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("简易正则编译失败: %w", err)
 	}
-	return p
+	return p, nil
 }
 
 // stripClass 从 "[章回卷节集部]" 形式提取内部字符。

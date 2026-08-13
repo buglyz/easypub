@@ -18,6 +18,13 @@ services:
       # 持久化输出与可选 config.xml / ereaders.xml
       - ./data:/data
     restart: unless-stopped
+    healthcheck:
+      # distroless 无 curl/wget，用二进制自身探测 /healthz。
+      test: ["CMD", "easypub", "health", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
     # 如需覆盖默认命令，例如只跑 CLI：
     # entrypoint: ["/usr/local/bin/easypub"]
     # command: ["-i", "/data/book.txt", "-o", "/data/book.epub"]
