@@ -85,32 +85,48 @@ make darwin   # 仅 macOS
   --mobi
 ```
 
+**批量转换（服务器/脚本场景）：**
+
+```bash
+# 转换 /data/books 目录内全部 *.txt/*.utf8/*.gbk 到 /data/epub
+./easypub -i /data/books -o /data/epub
+
+# 幂等重跑：已生成的 EPUB 不重复转换（适合 cron）
+./easypub -i /data/books -o /data/epub --skip-existing
+
+# cron 示例（每 10 分钟转换新放入的文件）：
+# */10 * * * * /opt/easypub/easypub -i /data/books -o /data/epub --skip-existing --quiet
+```
+
 | 选项 | 默认 | 说明 |
 |---|---|---|
-| `-i` | （必填） | 输入 TXT 路径 |
-| `-o` | 输入同名 `.epub` | 输出 EPUB 路径 |
-| `--title` | TXT 首行或文件名 | 书名 |
+| `-i` | （必填） | 输入 TXT 路径**或目录**（目录时批量转换其中 `.txt/.utf8/.gbk`） |
+| `-o` | 输入同名 `.epub` | 输出 EPUB 路径；目录输入时表示**输出目录**（默认=输入目录） |
+| `--title` | TXT 首行或文件名 | 书名（批量时应用到所有文件） |
 | `--author` | 空 | 作者 |
 | `--config` | 自动尝试 `config.xml` | EasyPub 风格 config.xml 路径 |
 | `--ereaders` | 随 config 目录 | ereaders.xml 路径 |
 | `--font` | 0 (-1=用第一个) | ereaders.xml 中阅读器字体方案索引 |
 | `--mobi` | false | 同时调用 `kindlegen` 生成 MOBI |
+| `--skip-existing` | false | 批量模式：目标 EPUB 已存在时跳过（幂等） |
 | `--quiet` | false | 静默模式 |
 | `-version` | | 打印版本 |
-
 ## WebUI 用法
 
 ```bash
 ./easypub serve
 # 默认仅本机: http://127.0.0.1:8080
-# 局域网暴露(无鉴权，慎用): ./easypub serve -addr 0.0.0.0:8080
+# 局域网/公网 + 鉴权: ./easypub serve -addr 0.0.0.0:8080 -token mysecret
+# 令牌也可用环境变量: EASYPUB_TOKEN=mysecret ./easypub serve -addr 0.0.0.0:8080
 ```
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
 | `-addr` | `127.0.0.1:8080` | 监听地址；默认仅本机。公网/局域网请显式指定并注意无鉴权风险 |
 | `-dir`  | 当前工作目录 | 工作目录，用于查找 `config.xml`/`ereaders.xml`，也是默认输出目录 |
+| `-token` | 空（不鉴权） | 访问令牌；非空时除 `/healthz` 外所有端点要求令牌（`X-Auth-Token` 头 / `Authorization: Bearer <token>` / `?token=`），也支持环境变量 `EASYPUB_TOKEN` |
 
+> 启用令牌后前端会在收到 401 时弹出令牌输入框，记住后自动带上；下载链接自动追加 `?token=`。
 WebUI 流程：
 1. 拖拽或点击选择 TXT 文件（自动探测编码）
 2. 填写书名、作者（可留空自动推断）
@@ -162,7 +178,59 @@ make docker-run
 
 镜像由 GitHub Actions（`.github/workflows/docker.yml`）构建并推送到 `ghcr.io/buglyz/easypub`，支持 `linux/amd64` 与 `linux/arm64`。
 
-> 注意：WebUI **无鉴权**。公网暴露请自行加反向代理与访问控制。容器内默认非 root 运行；MOBI 仍依赖宿主机/镜像内是否提供 `kindlegen`（官方镜像未内置）。
+> 注意：镜像默认**无鉴权**。公网暴露请务必通过 `EASYPUB_TOKEN` 环境变量设置访问令牌（`docker run -e EASYPUB_TOKEN=xxx ...` 或 compose 里的 `EASYPUB_TOKEN`），或加反向代理鉴权。容器内默认非 root 运行；MOBI 仍依赖宿主机/镜像内是否提供 `kindlegen`（官方镜像未内置）。
+
+## Linux 服务器部署
+
+三种方式任选：**systemd 直接跑二进制**（推荐，轻量可控）、**Docker**（隔离干净）、**批量 CLI**（脚本/cron 自动化）。
+
+### 方式一：systemd 直接部署（推荐）
+
+```bash
+# 1. 构建 Linux 二进制（在开发机上）
+make linux           # 产物 dist/easypub-linux-amd64
+
+# 2. 上传到服务器后一键安装
+scp dist/easypub-linux-amd64 root@your-server:/tmp/
+ssh root@your-server
+cd /tmp && git clone <本仓库> easypub   # 或仅拷贝 deploy/ 目录
+sudo ./deploy/install.sh /tmp/easypub-linux-amd64
+
+# 3. 设置访问令牌并重启
+sudo sed -i 's/^Environment=EASYPUB_TOKEN=.*/Environment=EASYPUB_TOKEN='$(openssl rand -hex 24)'/' /etc/systemd/system/easypub.service
+sudo systemctl daemon-reload && sudo systemctl restart easypub
+```
+
+- 服务默认监听 `127.0.0.1:8080`，建议用 Nginx/Caddy 反向代理加 HTTPS；
+- 数据目录 `/opt/easypub`（输出 `.easypub-output/`、可选 `config.xml`）；
+- 查看日志：`journalctl -u easypub -f`；
+- 安全加固已内置（nonroot 用户、`ProtectSystem=strict`、`PrivateTmp`、`NoNewPrivileges` 等）。
+
+### 方式二：Docker
+
+```bash
+docker run -d --name easypub -p 8080:8080 \
+  -e EASYPUB_TOKEN="$(openssl rand -hex 24)" \
+  -v "$PWD/data:/data" --restart unless-stopped \
+  ghcr.io/buglyz/easypub:edge
+```
+
+### 方式三：批量 CLI + cron
+
+适合"把 txt 丢进目录自动出 epub"的无人值守场景：
+
+```bash
+# 每 10 分钟转换一次新增文件（已生成的自动跳过）
+*/10 * * * * /opt/easypub/easypub -i /data/books -o /data/epub --skip-existing --quiet
+
+# 手动跑一次并看汇总
+/opt/easypub/easypub -i /data/books -o /data/epub
+# 输出: OK a.txt -> /data/epub/a.epub (编码 UTF-8, 120 章)
+# 输出: 批量完成: 成功 2 / 失败 0 / 跳过 1 / 共 3
+```
+
+> 批量模式单文件失败不中断，退出码非 0 表示有文件失败，可配合脚本告警。
+
 ## 配置文件
 
 可直接沿用原 EasyPub 的 `config.xml` / `ereaders.xml`。示例见 [`configs/`](configs/)。
@@ -206,8 +274,9 @@ make docker-run
 
 ```
 go-easypub/
-├── cmd/easypub/         CLI 入口（支持 serve 子命令）
+├── cmd/easypub/         CLI 入口（支持 serve / 批量目录转换）
 ├── internal/
+│   ├── batch/           目录批量转换（服务器/脚本场景）
 │   ├── config/          config.xml / ereaders.xml 解析
 │   ├── converter/       转换核心，CLI 与 WebUI 共用
 │   ├── css/             style.css 模板生成
@@ -218,9 +287,10 @@ go-easypub/
 │   └── webui/           WebUI 服务（内嵌静态前端）
 ├── configs/             原版兼容的示例 config.xml / ereaders.xml
 ├── css/                 提取自原工具的样例 style.css
+├── deploy/              Linux 部署：systemd 服务单元 + 一键安装脚本
 ├── testdata/            测试样例 TXT
 ├── Dockerfile           多阶段构建，默认入口为 WebUI
-├── docker-compose.yml   一键启动 WebUI
+├── docker-compose.yml   一键启动 WebUI（支持 EASYPUB_TOKEN）
 ├── Makefile             交叉编译与常用任务
 └── build.sh             POSIX shell 构建脚本（同 Makefile 逻辑的备份）
 ```
@@ -231,7 +301,7 @@ go-easypub/
 make test    # 或 go test ./...
 ```
 
-覆盖：分章（多正则、中阿数字、空行、加空行、缩进、HTML 转义），CSS 模板参数，EPUB 结构与 zip 方法，BOM 头，编码探测（UTF-8/GBK/UTF-16LE），config 往返，converter 集成，WebUI（HTTP 上传/转换/下载/路径穿越防护）。
+覆盖：分章（多正则、中阿数字、空行、加空行、缩进、HTML 转义），CSS 模板参数，EPUB 结构与 zip 方法，BOM 头，编码探测（UTF-8/GBK/UTF-16LE），config 往返，converter 集成，批量转换（多文件/输出目录/幂等跳过/单文件失败不中断），WebUI（HTTP 上传/转换/下载/路径穿越防护/令牌鉴权/探活豁免）。
 
 ## 持续集成
 

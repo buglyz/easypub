@@ -4,11 +4,13 @@ package webui
 
 import (
 	"context"
+	"crypto/subtle"
 	"embed"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -52,6 +54,9 @@ type Config struct {
 	Addr    string // 监听地址,如 "127.0.0.1:8080"
 	WorkDir string // 工作目录,用于查找 config.xml/ereaders.xml,也是默认输出目录
 	Version string
+	// Token 访问令牌；非空时所有业务端点(除 /healthz)要求 X-Auth-Token 头、
+	// Authorization: Bearer <token> 或 ?token= 查询参数。用于公网/局域网部署鉴权。
+	Token string
 }
 
 // Server 是 WebUI 服务。
@@ -88,11 +93,16 @@ func New(cfg Config) (*Server, error) {
 // 同时启动后台 goroutine 周期清理过期的输出产物，避免磁盘无限堆积。
 func (s *Server) Run() error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.withSecurityHeaders(s.handleIndex))
-	mux.HandleFunc("/api/detect", s.withSecurityHeaders(s.handleDetect))
-	mux.HandleFunc("/api/convert", s.withSecurityHeaders(s.handleConvert))
-	mux.HandleFunc("/api/download/", s.withSecurityHeaders(s.handleDownload))
-	// 轻量探活端点，供容器 healthcheck / 反代 / 监控使用。不带安全头无妨。
+	// 中间件顺序：请求日志 → 安全头 → 令牌鉴权 → 业务 handler。
+	protected := func(h http.HandlerFunc) http.HandlerFunc {
+		return s.withRequestLog(s.withSecurityHeaders(s.withAuth(h)))
+	}
+	mux.HandleFunc("/", protected(s.handleIndex))
+	mux.HandleFunc("/api/detect", protected(s.handleDetect))
+	mux.HandleFunc("/api/convert", protected(s.handleConvert))
+	mux.HandleFunc("/api/download/", protected(s.handleDownload))
+	// 轻量探活端点，供容器 healthcheck / 反代 / 监控使用。
+	// 不带安全头、不鉴权，保证无令牌也能探活。
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -103,8 +113,12 @@ func (s *Server) Run() error {
 	}
 	log.Printf("输出目录: %s", s.outputs)
 	log.Printf("产物保留 %s，每 %s 清理一次", outputRetention, cleanupInterval)
+	if s.cfg.Token != "" {
+		log.Printf("已启用令牌鉴权(除 /healthz 外的所有端点)")
+	} else {
+		log.Printf("警告: 未设置访问令牌,服务无鉴权; 公网部署请加 -token 或反向代理鉴权")
+	}
 	log.Printf("提示: 默认仅本机可访问；若需局域网访问请显式指定 -addr 0.0.0.0:8080 并注意无鉴权风险")
-
 	srv := &http.Server{
 		Addr:              s.cfg.Addr,
 		Handler:           mux,
@@ -192,6 +206,87 @@ func (s *Server) withSecurityHeaders(next http.HandlerFunc) http.HandlerFunc {
 		h.Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'")
 		next(w, r)
 	}
+}
+
+// withAuth 令牌鉴权中间件。cfg.Token 为空时不拦截任何请求。
+// 令牌来源优先级：X-Auth-Token 头 > Authorization: Bearer <token> > ?token= 查询参数。
+// 使用常量时间比较，避免时序侧信道。
+func (s *Server) withAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.Token == "" {
+			next(w, r)
+			return
+		}
+		if validToken(tokenFromRequest(r), s.cfg.Token) {
+			next(w, r)
+			return
+		}
+		w.Header().Set("WWW-Authenticate", `Bearer realm="easypub"`)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "缺少或无效的访问令牌"})
+	}
+}
+
+// tokenFromRequest 从请求中提取令牌。
+func tokenFromRequest(r *http.Request) string {
+	if v := r.Header.Get("X-Auth-Token"); v != "" {
+		return v
+	}
+	if v := r.Header.Get("Authorization"); v != "" {
+		// 兼容 "Bearer <token>" 形式。
+		if len(v) > 7 && strings.EqualFold(v[:7], "Bearer ") {
+			return strings.TrimSpace(v[7:])
+		}
+	}
+	if v := r.URL.Query().Get("token"); v != "" {
+		return v
+	}
+	return ""
+}
+
+// validToken 常量时间比较两个令牌。
+func validToken(got, want string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+}
+
+// statusRecorder 记录响应状态码，供请求日志使用。
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.status = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// withRequestLog 记录每个业务请求的方法/路径/状态码/耗时与来源 IP。
+// /healthz 不记录，避免探活刷屏。
+func (s *Server) withRequestLog(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next(rec, r)
+		log.Printf("%s %s %s -> %d (%s)", clientIP(r), r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
+	}
+}
+
+// clientIP 取来源 IP：优先 X-Forwarded-For(反代后)，否则 RemoteAddr。
+// X-Forwarded-For 可能被伪造，仅用于日志展示。
+func clientIP(r *http.Request) string {
+	if v := r.Header.Get("X-Forwarded-For"); v != "" {
+		if i := strings.IndexByte(v, ','); i >= 0 {
+			return strings.TrimSpace(v[:i])
+		}
+		return strings.TrimSpace(v)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
 }
 
 // handleIndex 提供内嵌前端页面与静态资源。

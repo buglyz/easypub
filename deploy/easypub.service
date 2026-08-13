@@ -1,0 +1,56 @@
+# EasyPub WebUI systemd 服务单元
+#
+# 安装：见 deploy/install.sh；手动安装示例：
+#   sudo cp easypub-linux-amd64 /opt/easypub/easypub
+#   sudo cp deploy/easypub.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now easypub
+#
+# 常用操作：
+#   systemctl status easypub     # 查看状态与最近日志
+#   journalctl -u easypub -f     # 跟踪日志
+#   systemctl restart easypub    # 重启
+#
+# 默认仅监听本机 127.0.0.1:8080，建议在前面加 Nginx/Caddy 反向代理
+# 并开启 HTTPS。如需直接暴露局域网/公网，把 -addr 改为 0.0.0.0:8080
+# 并务必在 Environment 里设置 EASYPUB_TOKEN（否则无鉴权）。
+
+[Unit]
+Description=EasyPub TXT to EPUB converter WebUI
+Documentation=https://github.com/buglyz/easypub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=easypub
+Group=easypub
+WorkingDirectory=/opt/easypub
+# WebUI 监听地址；默认仅本机，公网请改用 0.0.0.0:8080 并配置令牌。
+ExecStart=/opt/easypub/easypub serve -addr 127.0.0.1:8080 -dir /opt/easypub
+# 访问令牌：留空则不启用鉴权（仅建议本机/内网使用）。
+# 生成随机令牌：openssl rand -hex 24
+Environment=EASYPUB_TOKEN=
+Restart=on-failure
+RestartSec=3
+# 日志里显示启动信息
+StandardOutput=journal
+StandardError=journal
+
+# ---- 安全加固 ----
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# 只允许写 /opt/easypub（输出目录 .easypub-output 位于其中）
+ReadWritePaths=/opt/easypub
+# 容器/脚本常用工具允许读取；如无需可注释
+LockPersonality=true
+MemoryDenyWriteExecute=true
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

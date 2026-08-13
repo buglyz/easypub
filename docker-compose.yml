@@ -14,6 +14,10 @@ services:
     container_name: easypub
     ports:
       - "8080:8080"
+    environment:
+      # 访问令牌(留空则不鉴权)。公网部署务必设置,否则任何人可转换/下载。
+      # 生成: openssl rand -hex 24
+      EASYPUB_TOKEN: ${EASYPUB_TOKEN:-}
     volumes:
       # 持久化输出与可选 config.xml / ereaders.xml
       - ./data:/data

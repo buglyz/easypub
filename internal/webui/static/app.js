@@ -42,6 +42,63 @@
   var busy = false;
   var previewStale = false;
 
+  // ---- 令牌鉴权（服务端启用 -token 时）----
+  var authToken = localStorage.getItem("easypub_token") || "";
+  var lastAction = null; // "detect" | "convert"，用于输入令牌后重试
+  var tokenModal = document.getElementById("tokenModal");
+  var tokenInput = document.getElementById("tokenInput");
+  var tokenSubmit = document.getElementById("tokenSubmit");
+  var tokenCancel = document.getElementById("tokenCancel");
+
+  // 给 URL 追加令牌查询参数（下载链接 <a> 无法带自定义头）。
+  function withToken(url) {
+    if (!authToken) return url;
+    return url + (url.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(authToken);
+  }
+
+  // 为 fetch 附加鉴权头。
+  function authFetch(url, options) {
+    options = options || {};
+    var headers = options.headers || {};
+    if (authToken) headers["X-Auth-Token"] = authToken;
+    options.headers = headers;
+    return fetch(url, options);
+  }
+
+  function showTokenModal() {
+    tokenModal.hidden = false;
+    tokenInput.value = "";
+    tokenInput.focus();
+  }
+
+  function hideTokenModal() {
+    tokenModal.hidden = true;
+  }
+
+  tokenSubmit.addEventListener("click", function () {
+    var value = tokenInput.value.trim();
+    if (!value) return;
+    authToken = value;
+    try {
+      localStorage.setItem("easypub_token", authToken);
+    } catch (err) { /* 隐私模式等场景忽略 */ }
+    hideTokenModal();
+    setServiceState("令牌已保存", "ready");
+    if (lastAction === "convert") convertBook();
+    else if (lastAction === "detect") detectChapters();
+    lastAction = null;
+  });
+
+  tokenCancel.addEventListener("click", function () {
+    hideTokenModal();
+    lastAction = null;
+  });
+
+  tokenInput.addEventListener("keydown", function (event) {
+    if (event.key === "Enter") tokenSubmit.click();
+    if (event.key === "Escape") hideTokenModal();
+  });
+ 
   function formatSize(bytes) {
     if (bytes < 1024) return bytes + " B";
     if (bytes < 1048576) return (bytes / 1024).toFixed(1) + " KB";
@@ -223,6 +280,10 @@
         throw new Error("服务器返回了无法识别的响应。");
       }
       if (!response.ok) {
+        if (response.status === 401) {
+          showTokenModal();
+          throw new Error("需要访问令牌，请输入后重试。");
+        }
         throw new Error(data.error || ("请求失败（HTTP " + response.status + "）"));
       }
       return data;
@@ -269,8 +330,8 @@
 
   function createDownloadLink(label, url, secondary, downloadName) {
     var link = document.createElement("a");
+    link.href = withToken(url);
     link.className = secondary ? "download-link secondary" : "download-link";
-    link.href = url;
     if (downloadName) {
       link.setAttribute("download", downloadName);
     } else {
@@ -301,7 +362,7 @@
       );
     }
     if (data.mobi) {
-      var mobiURL = "/api/download/" + encodeURIComponent(data.mobi);
+      var mobiURL = withToken("/api/download/" + encodeURIComponent(data.mobi));
       if (data.mobiName) {
         mobiURL += "?name=" + encodeURIComponent(data.mobiName);
       }
@@ -351,8 +412,8 @@
     setServiceState("正在识别", "busy");
     setFlow("chapter", "active", "识别中");
     showMessage(preview, "正在识别章节，请稍候。", false);
-
-    fetch("/api/detect", { method: "POST", body: buildFormData() })
+    lastAction = "detect";
+    authFetch("/api/detect", { method: "POST", body: buildFormData() })
       .then(handleResponse)
       .then(function (data) {
         renderPreview(data);
@@ -390,8 +451,9 @@
     setFlow("layout", "done", "参数已提交");
     setFlow("convert", "active", "生成中");
     clearResult();
+    lastAction = "convert";
 
-    fetch("/api/convert", { method: "POST", body: buildFormData() })
+    authFetch("/api/convert", { method: "POST", body: buildFormData() })
       .then(handleResponse)
       .then(function (data) {
         renderResult(data);

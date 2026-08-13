@@ -409,3 +409,168 @@ func TestCleanupOnce_RemovesExpiredFiles(t *testing.T) {
 		t.Errorf("新鲜文件不应被删除, err=%v", err)
 	}
 }
+
+// ---- 令牌鉴权 ----
+
+// buildAuthMux 复刻 Run() 的中间件链(请求日志/安全头/鉴权)，用于走完整链路测试。
+func buildAuthMux(s *Server) *http.ServeMux {
+	mux := http.NewServeMux()
+	protected := func(h http.HandlerFunc) http.HandlerFunc {
+		return s.withRequestLog(s.withSecurityHeaders(s.withAuth(h)))
+	}
+	mux.HandleFunc("/", protected(s.handleIndex))
+	mux.HandleFunc("/api/detect", protected(s.handleDetect))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	return mux
+}
+
+func newAuthTestServer(t *testing.T, token string) (*Server, *httptest.Server) {
+	t.Helper()
+	dir := t.TempDir()
+	s, err := New(Config{Addr: "127.0.0.1:0", WorkDir: dir, Token: token})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	srv := httptest.NewServer(buildAuthMux(s))
+	t.Cleanup(srv.Close)
+	return s, srv
+}
+
+func TestAuth_RejectsMissingOrWrongToken(t *testing.T) {
+	_, srv := newAuthTestServer(t, "secret-token")
+
+	for name, req := range map[string]*http.Request{
+		"无令牌":      mustNewRequest(t, http.MethodGet, srv.URL),
+		"错误令牌":    withAuthHeader(mustNewRequest(t, http.MethodGet, srv.URL), "wrong"),
+		"Bearer 错误": withBearer(mustNewRequest(t, http.MethodGet, srv.URL), "wrong"),
+	} {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s 期望 401, got %d", name, resp.StatusCode)
+		}
+	}
+}
+
+func TestAuth_AcceptsToken(t *testing.T) {
+	_, srv := newAuthTestServer(t, "secret-token")
+
+	cases := []struct {
+		name string
+		req  *http.Request
+	}{
+		{"X-Auth-Token 头", withAuthHeader(mustNewRequest(t, http.MethodGet, srv.URL), "secret-token")},
+		{"Authorization Bearer", withBearer(mustNewRequest(t, http.MethodGet, srv.URL), "secret-token")},
+		{"?token= 查询参数", mustNewRequest(t, http.MethodGet, srv.URL+"?token=secret-token")},
+	}
+	for _, c := range cases {
+		resp, err := http.DefaultClient.Do(c.req)
+		if err != nil {
+			t.Fatalf("%s: %v", c.name, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s 期望 200, got %d", c.name, resp.StatusCode)
+		}
+	}
+}
+
+func TestAuth_HealthzExempt(t *testing.T) {
+	_, srv := newAuthTestServer(t, "secret-token")
+	resp, err := http.Get(srv.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("/healthz 不应要求令牌, got %d", resp.StatusCode)
+	}
+}
+
+func TestAuth_DisabledWhenTokenEmpty(t *testing.T) {
+	_, srv := newAuthTestServer(t, "")
+	resp, err := http.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("未启用令牌时不应拦截, got %d", resp.StatusCode)
+	}
+}
+
+func TestAuth_ApiDetectProtected(t *testing.T) {
+	_, srv := newAuthTestServer(t, "secret-token")
+	// 无令牌访问 /api/detect 应 401。
+	resp, err := http.Post(srv.URL+"/api/detect", "application/octet-stream", bytes.NewReader(nil))
+	if err != nil {
+		t.Fatalf("POST /api/detect: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("/api/detect 无令牌应 401, got %d", resp.StatusCode)
+	}
+}
+
+func TestTokenFromRequest(t *testing.T) {
+	r := httptest.NewRequest(http.MethodGet, "/x", nil)
+	r.Header.Set("X-Auth-Token", "h1")
+	if got := tokenFromRequest(r); got != "h1" {
+		t.Errorf("X-Auth-Token 优先, got %q", got)
+	}
+	r = httptest.NewRequest(http.MethodGet, "/x", nil)
+	r.Header.Set("Authorization", "Bearer h2")
+	if got := tokenFromRequest(r); got != "h2" {
+		t.Errorf("Bearer 解析失败, got %q", got)
+	}
+	r = httptest.NewRequest(http.MethodGet, "/x", nil)
+	r.Header.Set("Authorization", "Basic abc")
+	if got := tokenFromRequest(r); got != "" {
+		t.Errorf("非 Bearer 不应被接受, got %q", got)
+	}
+	r = httptest.NewRequest(http.MethodGet, "/x?token=h3", nil)
+	if got := tokenFromRequest(r); got != "h3" {
+		t.Errorf("查询参数解析失败, got %q", got)
+	}
+}
+
+func TestValidToken_ConstantTime(t *testing.T) {
+	if validToken("abc", "abc") != true {
+		t.Error("相同令牌应通过")
+	}
+	if validToken("abc", "abd") != false {
+		t.Error("不同令牌应拒绝")
+	}
+	if validToken("abc", "abcd") != false {
+		t.Error("长度不同应拒绝")
+	}
+	if validToken("", "") != true {
+		t.Error("空令牌相等应通过(仅当服务端未启用时才会走到)")
+	}
+}
+
+func withAuthHeader(r *http.Request, token string) *http.Request {
+	r.Header.Set("X-Auth-Token", token)
+	return r
+}
+
+func withBearer(r *http.Request, token string) *http.Request {
+	r.Header.Set("Authorization", "Bearer "+token)
+	return r
+}
+
+// mustNewRequest 构造可用于 http.Client.Do 的请求(httptest.NewRequest 会设置
+// RequestURI,导致客户端请求失败)。
+func mustNewRequest(t *testing.T, method, url string) *http.Request {
+	t.Helper()
+	req, err := http.NewRequest(method, url, nil)
+	if err != nil {
+		t.Fatalf("NewRequest(%s %s): %v", method, url, err)
+	}
+	return req
+}

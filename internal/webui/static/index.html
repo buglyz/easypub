@@ -246,6 +246,19 @@
 
   <footer class="footer">EasyPub · go-easypub · 本地处理，无上传云端</footer>
 </div>
+
+<!-- 访问令牌弹窗（服务端启用 -token 鉴权时出现） -->
+<div class="modal-backdrop" id="tokenModal" hidden>
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="tokenModalTitle">
+    <h2 id="tokenModalTitle">需要访问令牌</h2>
+    <p>此服务启用了访问令牌保护，请输入管理员提供的令牌后继续。</p>
+    <input type="password" id="tokenInput" placeholder="访问令牌" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="tokenCancel" type="button">取消</button>
+      <button class="btn btn-primary" id="tokenSubmit" type="button">提交</button>
+    </div>
+  </div>
+</div>
 <script src="/app.js"></script>
 </body>
 </html>
