@@ -1,0 +1,29 @@
+:root {
+  --bg: #f5f6f4;
+  --surface: #ffffff;
+  --surface-subtle: #fafbfa;
+  --surface-hover: #f0f3f1;
+  --border: #e2e7e3;
+  --border-strong: #cdd5cf;
+
+  --ink: #1d2420;
+  --ink-secondary: #4e5a53;
+  --ink-muted: #7a867e;
+
+  --brand: #2f6f5e;
+  --brand-hover: #255a4c;
+  --brand-soft: #eaf3ef;
+  --brand-ink: #1e4b3f;
+
+  --danger: #b4433f;
+  --danger-soft: #faeae9;
+  --warn: #8c6623;
+  --warn-soft: #f9f2e3;
+
+  --radius-sm: 6px;
+  --radius: 10px;
+  --topbar-h: 50px;
+  --statusbar-h: 48px;
+  --font-sans: "PingFang SC", "Microsoft YaHei", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Consolas", monospace;
+}

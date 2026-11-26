@@ -9,8 +9,51 @@ permissions:
   contents: write
 
 jobs:
+  build-desktop:
+    name: Build Desktop (windows/amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
+
+      - name: Build Frontend
+        working-directory: desktop/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Test & Build Desktop EXE
+        working-directory: desktop
+        shell: bash
+        run: |
+          mkdir -p ../dist
+          go test ./... -count=1
+          go build -trimpath -tags "desktop,production" \
+            -ldflags "-s -w -H windowsgui -X main.version=${GITHUB_REF_NAME}" \
+            -o ../dist/easypub-desktop-windows-amd64.exe .
+
+      - name: Upload Desktop Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-windows-amd64
+          path: dist/easypub-desktop-windows-amd64.exe
+          if-no-files-found: error
+
   release:
-    name: Build & Release
+    name: Build CLI & Release
+    needs: build-desktop
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,13 +74,19 @@ jobs:
           go vet ./...
           go test ./... -count=1
 
+      - name: Download Desktop Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: desktop-windows-amd64
+          path: dist
+
       - name: Compute version
         id: ver
         run: |
           echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
           echo "sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
 
-      - name: Build all platforms
+      - name: Build CLI all platforms
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
@@ -59,6 +108,7 @@ jobs:
           file dist/easypub-linux-amd64
           file dist/easypub-linux-arm64
           file dist/easypub-darwin-arm64
+          file dist/easypub-desktop-windows-amd64.exe
           dist/easypub-linux-amd64 -version
 
       - name: Generate checksums
@@ -79,6 +129,7 @@ jobs:
             dist/easypub-linux-amd64
             dist/easypub-linux-arm64
             dist/easypub-windows-amd64.exe
+            dist/easypub-desktop-windows-amd64.exe
             dist/easypub-darwin-amd64
             dist/easypub-darwin-arm64
             dist/checksums-sha256.txt

@@ -29,8 +29,14 @@ const (
 )
 
 // coverHTML 生成 cover.html。
-// 与样例对齐：<h1 class="booktitle">书名</h1> <h3 class="bookauthor">作者</h3>
+// 无自定义图片时与样例对齐：<h1 class="booktitle">书名</h1> <h3 class="bookauthor">作者</h3>；
+// 存在自定义封面图片时以居中图片渲染。
 func coverHTML(b *Book) string {
+	if href, _, ok := b.coverImageInfo(); ok {
+		body := fmt.Sprintf("<div class=\"centeredimage\">\n<img class=\"attpic\" src=\"%s\" alt=\"%s\" />\n</div>",
+			util.EscapeForXMLAttr(href), util.EscapeForXMLAttr(b.Title))
+		return fmt.Sprintf(htmlDoctype, "Cover", body)
+	}
 	body := fmt.Sprintf("<div>\n<h1 class=\"booktitle\">%s</h1>\n<h3 class=\"bookauthor\">%s</h3>\n</div>",
 		util.EscapeText(b.Title), util.EscapeText(b.Author))
 	return fmt.Sprintf(htmlDoctype, "Cover", body)
@@ -89,6 +95,10 @@ func opfXML(b *Book) string {
 	if b.Author != "" {
 		sb.WriteString(fmt.Sprintf("<dc:creator>%s</dc:creator>\n", util.EscapeText(b.Author)))
 	}
+	coverHref, coverMime, hasCoverImg := b.coverImageInfo()
+	if hasCoverImg {
+		sb.WriteString("<meta name=\"cover\" content=\"cover-image\"/>\n")
+	}
 	sb.WriteString("</metadata>\n")
 
 	// manifest
@@ -97,6 +107,10 @@ func opfXML(b *Book) string {
 	sb.WriteString("<item id=\"htmltoc\"  href=\"book-toc.html\" media-type=\"application/xhtml+xml\"/>\n")
 	sb.WriteString("<item id=\"css\" href=\"style.css\" media-type=\"text/css\"/>\n")
 	sb.WriteString("<item id=\"cover\" href=\"cover.html\" media-type=\"application/xhtml+xml\"/>\n")
+	if hasCoverImg {
+		sb.WriteString(fmt.Sprintf("<item id=\"cover-image\" href=\"%s\" media-type=\"%s\"/>\n",
+			util.EscapeForXMLAttr(coverHref), util.EscapeForXMLAttr(coverMime)))
+	}
 	for i := range b.Chapters {
 		sb.WriteString(fmt.Sprintf("<item id=\"chapter%d\" href=\"chapter%d.html\" media-type=\"application/xhtml+xml\"/>\n", i, i))
 	}

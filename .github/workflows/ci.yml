@@ -82,3 +82,35 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}
           if-no-files-found: error
+
+  desktop-windows:
+    name: Desktop UI (windows/amd64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: desktop/frontend/package-lock.json
+
+      - name: Build Desktop Frontend
+        working-directory: desktop/frontend
+        run: |
+          npm ci
+          npm run build
+
+      - name: Test & Build Desktop Binary
+        working-directory: desktop
+        run: |
+          go vet ./...
+          go test ./... -count=1
+          go build -trimpath -tags "desktop,production" -ldflags "-s -w -H windowsgui -X main.version=${GITHUB_REF_NAME:-dev}" -o ../easypub-desktop-windows-amd64.exe .

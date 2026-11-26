@@ -21,9 +21,15 @@ import (
 // Chapter 是切分后的一章。
 type Chapter struct {
 	// Title 章节标题，已去前后空白。若整章无标题则为空。
-	Title string
+	Title string `json:"title"`
 	// Body 段落列表(已转义、已规范化)，每个元素对应一个 <p>。
-	Body []string
+	Body []string `json:"body"`
+	// StartLine 该章在原始文本中的起始行号(1-based)。
+	StartLine int `json:"startLine"`
+	// LineCount 该章在原始文本中占据的行数(含标题行)。
+	LineCount int `json:"lineCount"`
+	// CharCount 正文有效字符数(不含空白与全角缩进)。
+	CharCount int `json:"charCount"`
 }
 
 // Options 控制解析行为。
@@ -125,8 +131,11 @@ func Parse(text string, opt Options) ([]Chapter, error) {
 
 	if opt.SplitMode == 2 {
 		return []Chapter{{
-			Title: "",
-			Body:  assembleBody(lines, 0, len(lines), opt),
+			Title:     "",
+			Body:      assembleBody(lines, 0, len(lines), opt),
+			StartLine: 1,
+			LineCount: len(lines),
+			CharCount: countBodyRunes(lines, 0, len(lines)),
 		}}, nil
 	}
 
@@ -158,7 +167,13 @@ func Parse(text string, opt Options) ([]Chapter, error) {
 	// 无标记：整本作为一章。
 	if len(marks) == 0 {
 		body := assembleBody(lines, 0, len(lines), opt)
-		return []Chapter{{Title: "", Body: body}}, nil
+		return []Chapter{{
+			Title:     "",
+			Body:      body,
+			StartLine: 1,
+			LineCount: len(lines),
+			CharCount: countBodyRunes(lines, 0, len(lines)),
+		}}, nil
 	}
 
 	// 去重相邻同标题(同一行被多个正则命中)。
@@ -169,7 +184,13 @@ func Parse(text string, opt Options) ([]Chapter, error) {
 	if marks[0].start > 0 {
 		body := assembleBody(lines, 0, marks[0].start, opt)
 		if len(body) > 0 || opt.ForceEmptyChapter {
-			chapters = append(chapters, Chapter{Title: "", Body: body})
+			chapters = append(chapters, Chapter{
+				Title:     "",
+				Body:      body,
+				StartLine: 1,
+				LineCount: marks[0].start,
+				CharCount: countBodyRunes(lines, 0, marks[0].start),
+			})
 		}
 	}
 	for i, m := range marks {
@@ -183,12 +204,24 @@ func Parse(text string, opt Options) ([]Chapter, error) {
 		// 空章保留与否完全由 ForceEmptyChapter 决定，标题命中不再例外强留，
 		// 避免 ForceEmptyChapter=false 时仍残留"有标题但 body 为空"的章节。
 		if len(body) > 0 || opt.ForceEmptyChapter {
-			chapters = append(chapters, Chapter{Title: m.title, Body: body})
+			chapters = append(chapters, Chapter{
+				Title:     m.title,
+				Body:      body,
+				StartLine: m.start + 1,
+				LineCount: end - m.start,
+				CharCount: countBodyRunes(lines, m.start+1, end),
+			})
 		}
 	}
 	if len(chapters) == 0 {
 		body := assembleBody(lines, 0, len(lines), opt)
-		return []Chapter{{Title: "", Body: body}}, nil
+		return []Chapter{{
+			Title:     "",
+			Body:      body,
+			StartLine: 1,
+			LineCount: len(lines),
+			CharCount: countBodyRunes(lines, 0, len(lines)),
+		}}, nil
 	}
 	return chapters, nil
 }
@@ -332,7 +365,13 @@ func splitByCount(lines []string, opt Options) []Chapter {
 	count := opt.SplitCount
 	if count <= 0 {
 		// 未配置字数阈值：退化为整本一章，避免无意义切分。
-		return []Chapter{{Title: "", Body: assembleBody(lines, 0, len(lines), opt)}}
+		return []Chapter{{
+			Title:     "",
+			Body:      assembleBody(lines, 0, len(lines), opt),
+			StartLine: 1,
+			LineCount: len(lines),
+			CharCount: countBodyRunes(lines, 0, len(lines)),
+		}}
 	}
 	var chapters []Chapter
 	var curStart int
@@ -341,8 +380,11 @@ func splitByCount(lines []string, opt Options) []Chapter {
 		body := assembleBody(lines, curStart, end, opt)
 		if len(body) > 0 || opt.ForceEmptyChapter {
 			chapters = append(chapters, Chapter{
-				Title: fmt.Sprintf("第%d章", len(chapters)+1),
-				Body:  body,
+				Title:     fmt.Sprintf("第%d章", len(chapters)+1),
+				Body:      body,
+				StartLine: curStart + 1,
+				LineCount: end - curStart,
+				CharCount: countBodyRunes(lines, curStart, end),
 			})
 		}
 		curStart = end
@@ -363,9 +405,39 @@ func splitByCount(lines []string, opt Options) []Chapter {
 	}
 	flush(len(lines))
 	if len(chapters) == 0 {
-		chapters = append(chapters, Chapter{Title: "", Body: assembleBody(lines, 0, len(lines), opt)})
+		chapters = append(chapters, Chapter{
+			Title:     "",
+			Body:      assembleBody(lines, 0, len(lines), opt),
+			StartLine: 1,
+			LineCount: len(lines),
+			CharCount: countBodyRunes(lines, 0, len(lines)),
+		})
 	}
 	return chapters
+}
+
+// countBodyRunes 统计 lines[start:end] 中的正文有效字符数（不含行首尾空白及全角空格）。
+func countBodyRunes(lines []string, start, end int) int {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(lines) {
+		end = len(lines)
+	}
+	total := 0
+	for i := start; i < end; i++ {
+		trimmed := strings.TrimSpace(strings.TrimRight(lines[i], "\r"))
+		if trimmed == "" {
+			continue
+		}
+		total += utf8.RuneCountInString(strings.TrimLeft(trimmed, "\u3000 "))
+	}
+	return total
+}
+
+// AssembleBody 导出段落组装逻辑，供桌面端按行号插入/重算章节正文复用。
+func AssembleBody(lines []string, start, end int, opt Options) ([]string, int) {
+	return assembleBody(lines, start, end, opt), countBodyRunes(lines, start, end)
 }
 
 // ReadFile 便捷读取并自动探测编码。

@@ -48,8 +48,18 @@ type Options struct {
 	TXTOverrides *txt.Options
 	// CSSOverrides 可选的 CSS 排版覆盖(WebUI 传入)。
 	CSSOverrides *CSSOverrides
-	// BaseDir 独立于 Input 的配置查找基准目录(如 WebUI 的工作目录)。
+	// BaseDir 独立于 Input 的配置查找基准目录(如 WebUI/桌面端的工作目录)。
 	BaseDir string
+	// CoverImagePath 可选本地封面图片路径(JPG/PNG/GIF/WebP)。
+	CoverImagePath string
+	// CoverImage 可选内存中的封面图片字节(优先级高于 CoverImagePath)。
+	CoverImage []byte
+	// ChaptersOverride 可选预编辑好的章节列表(桌面端可视化编辑后直出，非空时跳过 txt.Parse)。
+	ChaptersOverride []txt.Chapter
+	// KindleGenExe / KindleGenCompress / KindleGenOption 可选覆盖 mobi 配置。
+	KindleGenExe      string
+	KindleGenCompress int
+	KindleGenOption   string
 }
 
 // CSSOverrides 覆盖 CSS 排版参数(零值表示不使用该覆盖；MarginTop 为 0 时可配合 MarginTopSet=true 显式生效)。
@@ -143,13 +153,19 @@ func convertContent(ctx context.Context, opt Options, text, enc, outPath string)
 		}
 	}
 
-	txtOpt := buildTxtOptions(cfg)
-	if opt.TXTOverrides != nil {
-		txtOpt = mergeTxtOptions(txtOpt, *opt.TXTOverrides)
-	}
-	chapters, err := txt.Parse(text, txtOpt)
-	if err != nil {
-		return nil, &InputError{Err: fmt.Errorf("解析 TXT 失败: %w", err)}
+	var chapters []txt.Chapter
+	if len(opt.ChaptersOverride) > 0 {
+		chapters = opt.ChaptersOverride
+	} else {
+		txtOpt := buildTxtOptions(cfg)
+		if opt.TXTOverrides != nil {
+			txtOpt = mergeTxtOptions(txtOpt, *opt.TXTOverrides)
+		}
+		var err error
+		chapters, err = txt.Parse(text, txtOpt)
+		if err != nil {
+			return nil, &InputError{Err: fmt.Errorf("解析 TXT 失败: %w", err)}
+		}
 	}
 
 	if err := ctx.Err(); err != nil {
@@ -160,6 +176,19 @@ func convertContent(ctx context.Context, opt Options, text, enc, outPath string)
 	bookTitle := opt.Title
 	if bookTitle == "" {
 		bookTitle = inferTitle(text, opt.Input)
+	}
+
+	// 可选自定义封面图片。
+	coverImg := opt.CoverImage
+	if len(coverImg) == 0 && opt.CoverImagePath != "" {
+		b, err := os.ReadFile(opt.CoverImagePath)
+		if err != nil {
+			return nil, &InputError{Err: fmt.Errorf("读取封面图片失败: %w", err)}
+		}
+		if _, _, ok := epub.DetectImageType(b); !ok {
+			return nil, &InputError{Err: fmt.Errorf("不支持的封面图片格式（仅支持 JPG/PNG/GIF/WebP）")}
+		}
+		coverImg = b
 	}
 
 	// 字体方案。
@@ -177,11 +206,12 @@ func convertContent(ctx context.Context, opt Options, text, enc, outPath string)
 
 	// 组装并生成 EPUB。
 	book := &epub.Book{
-		Title:    bookTitle,
-		Author:   opt.Author,
-		Language: "zh-CN",
-		CSS:      cssContent,
-		Chapters: chapters,
+		Title:      bookTitle,
+		Author:     opt.Author,
+		Language:   "zh-CN",
+		CSS:        cssContent,
+		Chapters:   chapters,
+		CoverImage: coverImg,
 	}
 	gen := epub.New(book)
 	if err := gen.Build(outPath); err != nil {
@@ -198,6 +228,15 @@ func convertContent(ctx context.Context, opt Options, text, enc, outPath string)
 	// 可选 MOBI。
 	if opt.EnableMobi {
 		mobiOpt := buildMobiOptions(cfg)
+		if opt.KindleGenExe != "" {
+			mobiOpt.ExeName = opt.KindleGenExe
+		}
+		if opt.KindleGenCompress > 0 {
+			mobiOpt.Compress = opt.KindleGenCompress
+		}
+		if opt.KindleGenOption != "" {
+			mobiOpt.ExtraOptions = opt.KindleGenOption
+		}
 		mobiOpt.Quiet = opt.Quiet
 		mobiPath, merr := mobi.ConvertContext(ctx, mobiOpt, baseDir, outPath)
 		if merr != nil {
@@ -356,6 +395,11 @@ func resolveFontSrcs(cfg *config.Root, cfgDir, erPath string, fontIdx int) []str
 		}
 	}
 	return fontSrcs
+}
+
+// InferTitle 从正文首个非空行或文件名推断书名，供 CLI/桌面端复用。
+func InferTitle(text, path string) string {
+	return inferTitle(text, path)
 }
 
 func inferTitle(text, path string) string {

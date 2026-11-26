@@ -11,10 +11,11 @@
 - TXT → EPUB 2.0
   - `mimetype`（不压缩）+ `META-INF/container.xml`
   - `OEBPS/` 下完整生成 `content.opf`、`toc.ncx`、`style.css`、`cover.html`、`book-toc.html`、`chapterN.html`
-- **三种使用形态**：
-  - 命令行（CLI）：单文件二进制，脚本/批量场景
-  - WebUI：`easypub serve`，浏览器里拖拽上传、配参、识别章节、生成下载
-  - Docker：镜像默认启动 WebUI（`0.0.0.0:8080`）
+- **四种使用形态**：
+  - **现代桌面端（Desktop GUI）**：基于 Wails v2 + Vue 3 的三栏桌面工作台，支持原版可视化章节重命名/合并/删章/筛选短章、自定义封面图、实时排版预览与批量目录转换
+  - **命令行（CLI）**：单文件二进制，脚本/批量场景
+  - **WebUI**：`easypub serve`，浏览器里拖拽上传、配参、识别章节、生成下载
+  - **Docker**：镜像默认启动 WebUI（`0.0.0.0:8080`）
 - 自动识别章节标题（中文小说"第N章"、"序"、"楔子"、"番外"等，英文 `Chapter N`）
 - 支持三类正则来源：完整正则 / 简易三段式正则 / 预定义附加正则
 - 编码自动检测：UTF-8(BOM/无 BOM)、UTF-16(BE/LE BOM)、GBK、GB18030、Big5
@@ -41,8 +42,9 @@ Android 不在本项目支持范围。
 **方式一：直接下载预编译二进制**
 
 到 [Releases](https://github.com/buglyz/easypub/releases) 下载对应平台的二进制：
+- `easypub-desktop-windows-amd64.exe`（Windows 现代桌面 GUI 版，双击即用）
 - `easypub-linux-amd64` / `easypub-linux-arm64`
-- `easypub-windows-amd64.exe`
+- `easypub-windows-amd64.exe`（Windows 命令行 / WebUI 版）
 - `easypub-darwin-amd64` / `easypub-darwin-arm64`
 - `checksums-sha256.txt` 校验和
 
@@ -137,6 +139,22 @@ WebUI 流程：
 6. 点「开始转换」，完成后直接下载 EPUB（及 MOBI）
 
 生成的文件默认保存到 `<工作目录>/.easypub-output/`。
+
+## 桌面客户端用法（Desktop UI）
+
+桌面端位于 [`desktop/`](desktop/)，基于 Wails v2 + Vue 3 + TypeScript 构建，面向习惯原版 `EasyPub.exe` 精细调校电子书的桌面用户：
+
+- **三栏工作台**：左侧配置区（书籍/分章/版式/高级）、中间可视化章节管理器、右侧实时排版与原文行号预览
+- **可视化章节编辑**：双击标题改名、双击序号或按 `Enter` 合并/恢复目录、`Shift+Delete` 彻底删除广告章、按字数阈值一键筛选短章、按行号手动插入章节
+- **自定义封面与原版配置互通**：支持本地 JPG/PNG/WebP/GIF 图片封面或原版文字封面；完整读写原版 `config.xml` 与 `ereaders.xml`
+- **批量目录模式**：直接拖入小说文件夹，多核并发批量生成 EPUB/MOBI
+
+本地从源码构建桌面端（需 Go 1.25+、Node.js 20+ 与 Windows WebView2 Runtime）：
+
+```bash
+cd desktop/frontend && npm install && npm run build
+cd .. && go build -trimpath -tags "desktop,production" -ldflags "-s -w -H windowsgui" -o ../dist/easypub-desktop.exe .
+```
 
 ## Docker 用法
 

@@ -28,13 +28,52 @@ import (
 
 // Book 是待生成的 EPUB 元数据与章节。
 type Book struct {
-	Title    string
-	Author   string
-	Language string
-	Date     string // 如 "2025"；为空则取当前年份。
-	UID      string // 如 "easypub-6687cffa"；为空则随机生成。
-	CSS      string // style.css 内容。
-	Chapters []txt.Chapter
+	Title          string
+	Author         string
+	Language       string
+	Date           string // 如 "2025"；为空则取当前年份。
+	UID            string // 如 "easypub-6687cffa"；为空则随机生成。
+	CSS            string // style.css 内容。
+	Chapters       []txt.Chapter
+	CoverImage     []byte // 可选自定义封面图片字节（JPG/PNG/GIF/WebP）。
+	CoverImageExt  string // 如 ".jpg" / ".png"；为空时自动探测。
+	CoverImageMime string // 如 "image/jpeg" / "image/png"；为空时自动探测。
+}
+
+// DetectImageType 根据文件魔数识别常见封面图片格式。
+func DetectImageType(data []byte) (ext, mime string, ok bool) {
+	if len(data) >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+		return ".jpg", "image/jpeg", true
+	}
+	if len(data) >= 8 && string(data[:8]) == "\x89PNG\r\n\x1a\n" {
+		return ".png", "image/png", true
+	}
+	if len(data) >= 6 && (string(data[:6]) == "GIF87a" || string(data[:6]) == "GIF89a") {
+		return ".gif", "image/gif", true
+	}
+	if len(data) >= 12 && string(data[:4]) == "RIFF" && string(data[8:12]) == "WEBP" {
+		return ".webp", "image/webp", true
+	}
+	return "", "", false
+}
+
+// coverImageInfo 归一化书籍自定义封面信息；无有效图片时返回空。
+func (b *Book) coverImageInfo() (href, mime string, ok bool) {
+	if len(b.CoverImage) == 0 {
+		return "", "", false
+	}
+	ext, m := b.CoverImageExt, b.CoverImageMime
+	if ext == "" || m == "" {
+		var detected bool
+		ext, m, detected = DetectImageType(b.CoverImage)
+		if !detected {
+			return "", "", false
+		}
+	}
+	if !strings.HasPrefix(ext, ".") {
+		ext = "." + ext
+	}
+	return "cover" + strings.ToLower(ext), m, true
 }
 
 // Generator 负责流式组装并打包成 .epub。
@@ -124,6 +163,11 @@ func (g *Generator) WriteEPUB(dst io.Writer) error {
 	}
 	if err := writeTextEntry(w, "OEBPS/style.css", g.book.CSS, false); err != nil {
 		return err
+	}
+	if href, _, ok := g.book.coverImageInfo(); ok {
+		if err := writeRawEntry(w, "OEBPS/"+href, zip.Deflate, g.book.CoverImage); err != nil {
+			return err
+		}
 	}
 	if err := writeTextEntry(w, "OEBPS/cover.html", coverHTML(g.book), true); err != nil {
 		return err
