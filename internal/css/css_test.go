@@ -70,8 +70,15 @@ func TestGenerate_TextAlign(t *testing.T) {
 
 func TestGenerate_Indent(t *testing.T) {
 	got := Generate(Options{Indent: 2})
-	if !strings.Contains(got, "text-indent: 2rem;") {
-		t.Errorf("期望 text-indent 2rem")
+	if !strings.Contains(got, "text-indent: 2em;") {
+		t.Errorf("期望 text-indent 2em, got:\n%s", got)
+	}
+}
+
+func TestGenerate_MarginTopZero(t *testing.T) {
+	got := Generate(Options{MarginTop: 0})
+	if !strings.Contains(got, "margin-top: 0px;") {
+		t.Errorf("期望 margin-top: 0px;")
 	}
 }
 

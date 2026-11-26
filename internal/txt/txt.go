@@ -9,10 +9,7 @@
 package txt
 
 import (
-	"bufio"
-	"bytes"
 	"fmt"
-	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -104,6 +101,15 @@ var DefaultRegExps = []string{
 	`(?i)^\s*(Prologue|Epilogue|Interlude|Afterword|Preface|Foreword|Appendix|Introduction|Postscript|Extra|Side\s*Story)([:：.·—\-~\s].{0,60})?$`,
 }
 
+// defaultCompiledRegExps 在包初始化时预编译 DefaultRegExps，避免每次 Parse 重复编译。
+var defaultCompiledRegExps = func() []*regexp.Regexp {
+	out := make([]*regexp.Regexp, 0, len(DefaultRegExps))
+	for _, s := range DefaultRegExps {
+		out = append(out, regexp.MustCompile(s))
+	}
+	return out
+}()
+
 // Parse 解析 txt 文本，返回章节列表。
 // text 应已是 UTF-8、行尾已规范化的文本。
 func Parse(text string, opt Options) ([]Chapter, error) {
@@ -137,8 +143,12 @@ func Parse(text string, opt Options) ([]Chapter, error) {
 	var marks []seg
 	for i, line := range lines {
 		trim := strings.TrimSpace(line)
+		if trim == "" {
+			continue
+		}
+		same := trim == line
 		for _, p := range pats {
-			if p.MatchString(line) || p.MatchString(trim) {
+			if p.MatchString(line) || (!same && p.MatchString(trim)) {
 				marks = append(marks, seg{title: trim, start: i})
 				break
 			}
@@ -216,11 +226,7 @@ func buildPatterns(opt Options) ([]*regexp.Regexp, error) {
 		pats = append(pats, p)
 	}
 	if opt.AutoMark || len(pats) == 0 {
-		for _, s := range DefaultRegExps {
-			if p, err := regexp.Compile(s); err == nil {
-				pats = append(pats, p)
-			}
-		}
+		pats = append(pats, defaultCompiledRegExps...)
 	}
 	return pats, nil
 }
@@ -245,7 +251,7 @@ func buildSimplePattern(opt Options) (*regexp.Regexp, error) {
 	if opt.SimpleRegLeadingSpace {
 		lead = `\s*`
 	}
-	expr := lead + `^\s*` + p1 + "[" + digits + "]+" + p3 + `.*`
+	expr := `^` + lead + p1 + "[" + digits + "]+" + p3 + `.*`
 	p, err := regexp.Compile(expr)
 	if err != nil {
 		return nil, fmt.Errorf("简易正则编译失败: %w", err)
@@ -334,7 +340,10 @@ func splitByCount(lines []string, opt Options) []Chapter {
 	flush := func(end int) {
 		body := assembleBody(lines, curStart, end, opt)
 		if len(body) > 0 || opt.ForceEmptyChapter {
-			chapters = append(chapters, Chapter{Title: "", Body: body})
+			chapters = append(chapters, Chapter{
+				Title: fmt.Sprintf("第%d章", len(chapters)+1),
+				Body:  body,
+			})
 		}
 		curStart = end
 		curCount = 0
@@ -391,15 +400,5 @@ func ScanLines(path string) ([]string, error) {
 
 // readFile 在 util 之外独立以便循环依赖最小。
 func readFile(path string) ([]byte, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	var buf bytes.Buffer
-	w := bufio.NewWriter(&buf)
-	if _, err := io.Copy(w, f); err != nil {
-		return nil, err
-	}
-	return buf.Bytes(), nil
+	return os.ReadFile(path)
 }

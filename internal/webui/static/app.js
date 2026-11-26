@@ -305,21 +305,28 @@
     var list = document.createElement("ol");
     list.className = "chapter-list";
     var titles = Array.isArray(data.titles) ? data.titles : [];
-    titles.slice(0, PREVIEW_LIMIT).forEach(function (chapterTitle) {
-      if (!chapterTitle) {
-        return;
+    if (titles.length === 0 && (data.count || 0) > 0) {
+      var wholeMsg = document.createElement("div");
+      wholeMsg.className = "preview-message";
+      wholeMsg.textContent = "整本将合并为 " + data.count + " 章（无分章目录）。";
+      preview.appendChild(wholeMsg);
+    } else {
+      titles.slice(0, PREVIEW_LIMIT).forEach(function (chapterTitle) {
+        if (!chapterTitle) {
+          return;
+        }
+        var item = document.createElement("li");
+        item.textContent = chapterTitle;
+        list.appendChild(item);
+      });
+      if (titles.length > PREVIEW_LIMIT) {
+        var more = document.createElement("li");
+        more.className = "more";
+        more.textContent = "其余 " + (titles.length - PREVIEW_LIMIT) + " 章未展开";
+        list.appendChild(more);
       }
-      var item = document.createElement("li");
-      item.textContent = chapterTitle;
-      list.appendChild(item);
-    });
-    if (titles.length > PREVIEW_LIMIT) {
-      var more = document.createElement("li");
-      more.className = "more";
-      more.textContent = "其余 " + (titles.length - PREVIEW_LIMIT) + " 章未展开";
-      list.appendChild(more);
+      preview.appendChild(list);
     }
-    preview.appendChild(list);
 
     chapterCount.textContent = (data.count || 0) + " 章";
     document.getElementById("summaryEncoding").textContent = data.encoding || "-";
@@ -362,10 +369,10 @@
       );
     }
     if (data.mobi) {
-      var mobiURL = withToken("/api/download/" + encodeURIComponent(data.mobi));
-      if (data.mobiName) {
-        mobiURL += "?name=" + encodeURIComponent(data.mobiName);
-      }
+      var mobiURL = data.mobiDownload || (
+        "/api/download/" + encodeURIComponent(data.mobi) +
+        (data.mobiName ? "?name=" + encodeURIComponent(data.mobiName) : "")
+      );
       resultActions.appendChild(
         createDownloadLink(
           data.mobiName || "MOBI 文件",
@@ -599,4 +606,13 @@
   updateChapterMode();
   updateAddSpace();
   clearPreview();
+
+  // 启动时轻量探测鉴权状态；若服务端启用 -token 且本地令牌缺失或失效，提前弹出输入框。
+  authFetch("/api/auth")
+    .then(function (resp) {
+      if (resp.status === 401) {
+        showTokenModal();
+      }
+    })
+    .catch(function () { /* 忽略初始网络波动 */ });
 })();

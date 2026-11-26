@@ -14,10 +14,10 @@ package epub
 
 import (
 	"archive/zip"
-	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -37,17 +37,9 @@ type Book struct {
 	Chapters []txt.Chapter
 }
 
-// Generator 收集产物并打包成 .epub。
+// Generator 负责流式组装并打包成 .epub。
 type Generator struct {
 	book *Book
-	// entries 维护写入顺序：mimetype 必须第一且不压缩。
-	entries []entry
-}
-
-type entry struct {
-	name    string
-	method  uint16
-	content []byte
 }
 
 const (
@@ -59,6 +51,13 @@ const (
   </rootfiles>
 </container>
 `
+)
+
+var (
+	utf8BOM   = []byte{0xEF, 0xBB, 0xBF}
+	crlfBytes = []byte("\r\n")
+	// fixedZipTime 固定时间戳，避免每次生成因 Modified 不同导致字节级 diff。
+	fixedZipTime = time.Unix(0, 0).UTC()
 )
 
 // New 创建生成器。
@@ -76,121 +75,131 @@ func New(b *Book) *Generator {
 }
 
 // Build 生成 .epub 到 outPath。
+// 使用同目录临时文件 + 原子重命名，避免中断留下损坏产物；
+// 并逐条流式写入 zip，避免把全书章节副本二次缓存在内存中。
 func (g *Generator) Build(outPath string) error {
-	g.entries = nil
-	g.addMimetype()
-	g.addContainer()
-	g.addCSS()
-	g.addCover()
-	g.addBookTOC()
-	g.addChapters()
-	g.addOPF()
-	g.addNCX()
-	// 与样例对齐：所有 XHTML/XML 文本加 UTF-8 BOM 并使用 CRLF。
-	g.normalizeTextEntries()
-	return g.writeZip(outPath)
-}
-
-func (g *Generator) addMimetype() {
-	g.entries = append(g.entries, entry{
-		name:    "mimetype",
-		method:  zip.Store, // EPUB 规范要求 mimetype 不压缩
-		content: []byte(mimetypeContent),
-	})
-}
-
-func (g *Generator) addContainer() {
-	g.entries = append(g.entries, entry{
-		name:    "META-INF/container.xml",
-		method:  zip.Deflate,
-		content: []byte(containerXML),
-	})
-}
-
-func (g *Generator) addCSS() {
-	css := g.book.CSS
-	g.entries = append(g.entries, entry{
-		name:    "OEBPS/style.css",
-		method:  zip.Deflate,
-		content: []byte(css),
-	})
-}
-
-func (g *Generator) addCover() {
-	html := coverHTML(g.book)
-	g.entries = append(g.entries, entry{
-		name:    "OEBPS/cover.html",
-		method:  zip.Deflate,
-		content: []byte(html),
-	})
-}
-
-func (g *Generator) addBookTOC() {
-	html := bookTOCHTML(g.book)
-	g.entries = append(g.entries, entry{
-		name:    "OEBPS/book-toc.html",
-		method:  zip.Deflate,
-		content: []byte(html),
-	})
-}
-
-func (g *Generator) addChapters() {
-	for i := range g.book.Chapters {
-		html := chapterHTML(g.book, i)
-		g.entries = append(g.entries, entry{
-			name:    fmt.Sprintf("OEBPS/chapter%d.html", i),
-			method:  zip.Deflate,
-			content: []byte(html),
-		})
-	}
-}
-
-func (g *Generator) addOPF() {
-	opf := opfXML(g.book)
-	g.entries = append(g.entries, entry{
-		name:    "OEBPS/content.opf",
-		method:  zip.Deflate,
-		content: []byte(opf),
-	})
-}
-
-func (g *Generator) addNCX() {
-	ncx := ncxXML(g.book)
-	g.entries = append(g.entries, entry{
-		name:    "OEBPS/toc.ncx",
-		method:  zip.Deflate,
-		content: []byte(ncx),
-	})
-}
-
-func (g *Generator) writeZip(outPath string) error {
-	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+	dir := filepath.Dir(outPath)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.Create(outPath)
+	tmp, err := os.CreateTemp(dir, ".easypub-*.tmp")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	w := zip.NewWriter(f)
-	// 固定时间戳，避免每次生成因 Modified 不同导致字节级 diff。
-	// 使用 Unix epoch，与跨平台确定性构建目标一致。
-	fixedTime := time.Unix(0, 0).UTC()
-	for _, e := range g.entries {
-		hdr := &zip.FileHeader{
-			Name:     e.name,
-			Method:   e.method,
-			Modified: fixedTime,
+	tmpPath := tmp.Name()
+	success := false
+	defer func() {
+		if !success {
+			_ = tmp.Close()
+			_ = os.Remove(tmpPath)
 		}
-		fw, err := w.CreateHeader(hdr)
-		if err != nil {
-			return err
-		}
-		if _, err := fw.Write(e.content); err != nil {
+	}()
+
+	if err := g.WriteEPUB(tmp); err != nil {
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, outPath); err != nil {
+		return err
+	}
+	success = true
+	return nil
+}
+
+// WriteEPUB 将完整 EPUB ZIP 写入 dst。
+// 条目顺序、压缩方式、CRLF 与 UTF-8 BOM 规则与 EasyPub v1.50 样例字节级一致：
+//   - mimetype：Store（不压缩）、无 BOM、无 CRLF
+//   - META-INF/container.xml / OEBPS/style.css：Deflate、CRLF、无 BOM
+//   - 其余 OEBPS/*.html|*.opf|*.ncx：Deflate、CRLF、有 BOM
+func (g *Generator) WriteEPUB(dst io.Writer) error {
+	w := zip.NewWriter(dst)
+
+	if err := writeRawEntry(w, "mimetype", zip.Store, []byte(mimetypeContent)); err != nil {
+		return err
+	}
+	if err := writeTextEntry(w, "META-INF/container.xml", containerXML, false); err != nil {
+		return err
+	}
+	if err := writeTextEntry(w, "OEBPS/style.css", g.book.CSS, false); err != nil {
+		return err
+	}
+	if err := writeTextEntry(w, "OEBPS/cover.html", coverHTML(g.book), true); err != nil {
+		return err
+	}
+	if err := writeTextEntry(w, "OEBPS/book-toc.html", bookTOCHTML(g.book), true); err != nil {
+		return err
+	}
+	for i := range g.book.Chapters {
+		name := fmt.Sprintf("OEBPS/chapter%d.html", i)
+		if err := writeTextEntry(w, name, chapterHTML(g.book, i), true); err != nil {
 			return err
 		}
 	}
+	if err := writeTextEntry(w, "OEBPS/content.opf", opfXML(g.book), true); err != nil {
+		return err
+	}
+	if err := writeTextEntry(w, "OEBPS/toc.ncx", ncxXML(g.book), true); err != nil {
+		return err
+	}
 	return w.Close()
+}
+
+func writeRawEntry(w *zip.Writer, name string, method uint16, content []byte) error {
+	fw, err := w.CreateHeader(&zip.FileHeader{
+		Name:     name,
+		Method:   method,
+		Modified: fixedZipTime,
+	})
+	if err != nil {
+		return err
+	}
+	_, err = fw.Write(content)
+	return err
+}
+
+// writeTextEntry 流式写入带 CRLF 行尾（可选 UTF-8 BOM）的文本条目，避免整章内存拷贝。
+func writeTextEntry(w *zip.Writer, name, text string, withBOM bool) error {
+	fw, err := w.CreateHeader(&zip.FileHeader{
+		Name:     name,
+		Method:   zip.Deflate,
+		Modified: fixedZipTime,
+	})
+	if err != nil {
+		return err
+	}
+	if withBOM && !strings.HasPrefix(text, "\uFEFF") {
+		if _, err := fw.Write(utf8BOM); err != nil {
+			return err
+		}
+	}
+	return writeCRLF(fw, text)
+}
+
+// writeCRLF 将 text 中的 \r\n 或 \n 统一按 \r\n 写入 w，无额外大块内存分配。
+func writeCRLF(w io.Writer, text string) error {
+	for len(text) > 0 {
+		idx := strings.IndexByte(text, '\n')
+		if idx < 0 {
+			_, err := io.WriteString(w, text)
+			return err
+		}
+		seg := text[:idx]
+		if len(seg) > 0 && seg[len(seg)-1] == '\r' {
+			seg = seg[:len(seg)-1]
+		}
+		if len(seg) > 0 {
+			if _, err := io.WriteString(w, seg); err != nil {
+				return err
+			}
+		}
+		if _, err := w.Write(crlfBytes); err != nil {
+			return err
+		}
+		text = text[idx+1:]
+	}
+	return nil
 }
 
 // randomID 生成 n 字节的十六进制 ID，如 "6687cffa"。
@@ -200,34 +209,4 @@ func randomID(n int) string {
 		return "00000000"
 	}
 	return hex.EncodeToString(b)
-}
-
-// normalizeTextEntries 给文本类条目统一 CRLF 与(部分) UTF-8 BOM，
-// 与 EasyPub v1.50 样例输出字节级对齐。
-//   - mimetype：原样不动(无 BOM、无 CRLF)
-//   - META-INF/container.xml：CRLF、无 BOM
-//   - OEBPS/style.css：CRLF、无 BOM
-//   - 其余 OEBPS/*.html|*.opf|*.ncx：CRLF、有 BOM
-func (g *Generator) normalizeTextEntries() {
-	bom := []byte{0xEF, 0xBB, 0xBF}
-	for i, e := range g.entries {
-		if e.name == "mimetype" {
-			continue
-		}
-		s := string(e.content)
-		// 统一 CRLF。
-		s = strings.ReplaceAll(s, "\r\n", "\n")
-		s = strings.ReplaceAll(s, "\n", "\r\n")
-		switch e.name {
-		case "META-INF/container.xml", "OEBPS/style.css":
-			g.entries[i].content = []byte(s)
-			continue
-		}
-		// 其余：加 BOM(若尚未有)。
-		if !bytes.HasPrefix(e.content, bom) {
-			g.entries[i].content = append(bom, []byte(s)...)
-		} else {
-			g.entries[i].content = []byte(s)
-		}
-	}
 }

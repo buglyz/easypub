@@ -2,10 +2,15 @@ package converter
 
 import (
 	"archive/zip"
+	"context"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/easypub/go-easypub/internal/txt"
 )
 
 // TestConvert_BasicRoundTrip 验证完整转换路径:TXT → EPUB(结构完整,可读,书名正确)。
@@ -148,5 +153,72 @@ func TestConvert_BadConfigReturnsError(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("损坏 config 应返回 error")
+	}
+}
+
+func TestConvertText_PreservesEncodingAndMarginTopZero(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.epub")
+	res, err := ConvertText(context.Background(), Options{
+		Input:   "原文件.txt",
+		Output:  out,
+		BaseDir: dir,
+		Title:   "测试",
+		CSSOverrides: &CSSOverrides{
+			LineHeight:   140,
+			FontSize:     110,
+			MarginTop:    0,
+			MarginTopSet: true,
+			Indent:       2,
+		},
+	}, "第1章 开端\n　　正文。\n", "GBK")
+	if err != nil {
+		t.Fatalf("ConvertText: %v", err)
+	}
+	if res.Encoding != "GBK" {
+		t.Errorf("Encoding=%q, 期望 GBK", res.Encoding)
+	}
+
+	r, err := zip.OpenReader(out)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	for _, f := range r.File {
+		if f.Name != "OEBPS/style.css" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		cssBytes, _ := io.ReadAll(rc)
+		rc.Close()
+		cssText := string(cssBytes)
+		if !strings.Contains(cssText, "margin-top: 0px;") {
+			t.Errorf("MarginTop=0 覆盖未生效:\n%s", cssText)
+		}
+		if !strings.Contains(cssText, "text-indent: 2em;") {
+			t.Errorf("Indent 单位应为 em:\n%s", cssText)
+		}
+		return
+	}
+	t.Fatal("未找到 OEBPS/style.css")
+}
+
+func TestConvertText_InvalidRegexReturnsInputError(t *testing.T) {
+	dir := t.TempDir()
+	_, err := ConvertText(context.Background(), Options{
+		Input:        "a.txt",
+		Output:       filepath.Join(dir, "out.epub"),
+		BaseDir:      dir,
+		TXTOverrides: &txt.Options{SplitMode: 0, FullReg: "[unclosed"},
+	}, "正文\n", "UTF-8")
+	if err == nil {
+		t.Fatal("非法正则应报错")
+	}
+	var inErr *InputError
+	if !errors.As(err, &inErr) {
+		t.Errorf("非法正则应返回 *InputError, got %T: %v", err, err)
 	}
 }

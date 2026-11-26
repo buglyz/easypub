@@ -12,19 +12,25 @@ import (
 	"github.com/easypub/go-easypub/internal/util"
 )
 
-// parseUpload 解析 multipart 上传,返回 detectReq 与解码后的文本。
+// maxMultipartMemory 是 multipart 解析的内存阈值(16MB)；超过部分暂存临时文件并在返回时清理。
+const maxMultipartMemory = 16 << 20
+
+// parseUpload 解析 multipart 上传，返回 detectReq、解码后的文本与探测到的原始编码。
 // 忽略客户端 configPath 字段(防任意文件读取)。
-func parseUpload(r *http.Request) (*detectReq, string, error) {
-	req, text, _, err := parseUploadWithName(r)
-	return req, text, err
+func parseUpload(r *http.Request) (*detectReq, string, string, error) {
+	req, text, encoding, _, err := parseUploadWithName(r)
+	return req, text, encoding, err
 }
 
-// parseUploadWithName 同 parseUpload,额外返回净化后的原始文件名(仅 base name)。
-func parseUploadWithName(r *http.Request) (*detectReq, string, string, error) {
+// parseUploadWithName 同 parseUpload，额外返回净化后的原始文件名(仅 base name)。
+func parseUploadWithName(r *http.Request) (*detectReq, string, string, string, error) {
 	// 硬限制 body 大小，防止超大上传撑爆内存。
 	r.Body = http.MaxBytesReader(nil, r.Body, maxUploadBytes+1<<20) // 表单开销余量
-	if err := r.ParseMultipartForm(maxUploadBytes); err != nil {
-		return nil, "", "", fmt.Errorf("解析上传失败: 文件过大或格式错误")
+	if err := r.ParseMultipartForm(maxMultipartMemory); err != nil {
+		return nil, "", "", "", fmt.Errorf("解析上传失败: 文件过大或格式错误")
+	}
+	if r.MultipartForm != nil {
+		defer r.MultipartForm.RemoveAll()
 	}
 	// 显式忽略 configPath，即使客户端发送也不读取。
 	_ = r.FormValue("configPath")
@@ -42,7 +48,7 @@ func parseUploadWithName(r *http.Request) (*detectReq, string, string, error) {
 
 	file, hdr, err := r.FormFile("file")
 	if err != nil {
-		return nil, "", "", fmt.Errorf("缺少文件字段")
+		return nil, "", "", "", fmt.Errorf("缺少文件字段")
 	}
 	defer file.Close()
 	name := "upload.txt"
@@ -57,16 +63,16 @@ func parseUploadWithName(r *http.Request) (*detectReq, string, string, error) {
 	limited := io.LimitReader(file, maxUploadBytes+1)
 	data, err := io.ReadAll(limited)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("读取文件失败")
+		return nil, "", "", "", fmt.Errorf("读取文件失败")
 	}
 	if int64(len(data)) > maxUploadBytes {
-		return nil, "", "", fmt.Errorf("文件超过 %d MB 限制", maxUploadBytes>>20)
+		return nil, "", "", "", fmt.Errorf("文件超过 %d MB 限制", maxUploadBytes>>20)
 	}
-	text, _, err := util.DetectAndDecode(data)
+	text, encoding, err := util.DetectAndDecode(data)
 	if err != nil {
-		return nil, "", "", fmt.Errorf("编码识别失败")
+		return nil, "", "", "", fmt.Errorf("编码识别失败")
 	}
-	return req, text, name, nil
+	return req, text, encoding, name, nil
 }
 
 func atoi(s string) int {

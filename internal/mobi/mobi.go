@@ -75,6 +75,14 @@ func FindExe(opt Options, baseDir string) (string, error) {
 // Convert 调用 kindlegen 把 epubPath 转成 mobi。
 // 输出文件路径与 epubPath 同目录、同主名、扩展名 .mobi。
 func Convert(opt Options, baseDir, epubPath string) (string, error) {
+	return ConvertContext(context.Background(), opt, baseDir, epubPath)
+}
+
+// ConvertContext 同 Convert，但支持通过 ctx 取消正在运行的 kindlegen 进程。
+func ConvertContext(ctx context.Context, opt Options, baseDir, epubPath string) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	exePath, err := FindExe(opt, baseDir)
 	if err != nil {
 		return "", err
@@ -93,10 +101,10 @@ func Convert(opt Options, baseDir, epubPath string) (string, error) {
 		}
 		args = append(args, extra...)
 	}
-	// 超时保护，避免 kindlegen 卡死占满工作线程。
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	// 超时保护，避免 kindlegen 卡死占满工作线程；同时响应上游取消信号。
+	runCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, exePath, args...)
+	cmd := exec.CommandContext(runCtx, exePath, args...)
 	if opt.Quiet {
 		cmd.Stdout = io.Discard
 		cmd.Stderr = io.Discard

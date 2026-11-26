@@ -2,6 +2,9 @@ package epub
 
 import (
 	"archive/zip"
+	"bytes"
+	"io"
+	"os"
 	"strings"
 	"testing"
 
@@ -260,6 +263,64 @@ func TestBuild_HTMLHasBOM(t *testing.T) {
 		rc.Close()
 		if n < 3 || buf[0] != bom[0] || buf[1] != bom[1] || buf[2] != bom[2] {
 			t.Errorf("%s 缺 UTF-8 BOM", f.Name)
+		}
+	}
+}
+
+func TestBuild_DeterministicCRLFAndAtomicCleanup(t *testing.T) {
+	dir := t.TempDir()
+	out1 := dir + "/a.epub"
+	out2 := dir + "/b.epub"
+	if err := New(sampleBook()).Build(out1); err != nil {
+		t.Fatalf("Build 1: %v", err)
+	}
+	if err := New(sampleBook()).Build(out2); err != nil {
+		t.Fatalf("Build 2: %v", err)
+	}
+	b1, err := os.ReadFile(out1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, err := os.ReadFile(out2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(b1, b2) {
+		t.Fatal("相同输入两次 Build 产物应字节完全一致")
+	}
+
+	// 验证目录无残留 .tmp 临时文件。
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("残留临时文件: %s", e.Name())
+		}
+	}
+
+	// 验证文本条目均使用 CRLF 且无重复 \r\r\n。
+	r, err := zip.OpenReader(out1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	for _, f := range r.File {
+		if f.Name == "mimetype" {
+			continue
+		}
+		rc, err := f.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := io.ReadAll(rc)
+		rc.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(data, []byte("\r\r\n")) {
+			t.Errorf("%s 含重复 CR", f.Name)
+		}
+		if bytes.Contains(data, []byte("\n")) && !bytes.Contains(data, []byte("\r\n")) {
+			t.Errorf("%s 应使用 CRLF", f.Name)
 		}
 	}
 }

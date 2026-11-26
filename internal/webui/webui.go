@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -21,6 +22,7 @@ import (
 	"syscall"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/easypub/go-easypub/internal/converter"
 	"github.com/easypub/go-easypub/internal/txt"
@@ -88,16 +90,20 @@ func New(cfg Config) (*Server, error) {
 	}, nil
 }
 
-// Run 启动 HTTP 服务并阻塞，直至收到 SIGINT/SIGTERM 或发生致命错误。
-// 优雅关闭：收到信号后等待在途请求最多 shutdownTimeout，再强制断开。
-// 同时启动后台 goroutine 周期清理过期的输出产物，避免磁盘无限堆积。
-func (s *Server) Run() error {
+// Handler 构建包含完整路由与中间件链的 HTTP Handler，供 Run 与单元测试共用。
+// 静态页面壳（/、/style.css、/app.js）不含用户数据，放行以便启用 -token 时前端能加载并弹出令牌输入框；
+// 所有 /api/* 业务接口均强制校验令牌。
+func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
+	public := func(h http.HandlerFunc) http.HandlerFunc {
+		return s.withRequestLog(s.withSecurityHeaders(h))
+	}
 	// 中间件顺序：请求日志 → 安全头 → 令牌鉴权 → 业务 handler。
 	protected := func(h http.HandlerFunc) http.HandlerFunc {
 		return s.withRequestLog(s.withSecurityHeaders(s.withAuth(h)))
 	}
-	mux.HandleFunc("/", protected(s.handleIndex))
+	mux.HandleFunc("/", public(s.handleIndex))
+	mux.HandleFunc("/api/auth", protected(s.handleAuthCheck))
 	mux.HandleFunc("/api/detect", protected(s.handleDetect))
 	mux.HandleFunc("/api/convert", protected(s.handleConvert))
 	mux.HandleFunc("/api/download/", protected(s.handleDownload))
@@ -106,6 +112,14 @@ func (s *Server) Run() error {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
+	return mux
+}
+
+// Run 启动 HTTP 服务并阻塞，直至收到 SIGINT/SIGTERM 或发生致命错误。
+// 优雅关闭：收到信号后等待在途请求最多 shutdownTimeout，再强制断开。
+// 同时启动后台 goroutine 周期清理过期的输出产物，避免磁盘无限堆积。
+func (s *Server) Run() error {
+	mux := s.Handler()
 
 	log.Printf("EasyPub WebUI 已启动: http://%s", s.cfg.Addr)
 	if s.cfg.Version != "" {
@@ -114,7 +128,7 @@ func (s *Server) Run() error {
 	log.Printf("输出目录: %s", s.outputs)
 	log.Printf("产物保留 %s，每 %s 清理一次", outputRetention, cleanupInterval)
 	if s.cfg.Token != "" {
-		log.Printf("已启用令牌鉴权(除 /healthz 外的所有端点)")
+		log.Printf("已启用令牌鉴权(所有 /api/* 端点)")
 	} else {
 		log.Printf("警告: 未设置访问令牌,服务无鉴权; 公网部署请加 -token 或反向代理鉴权")
 	}
@@ -124,9 +138,10 @@ func (s *Server) Run() error {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       120 * time.Second,
-		WriteTimeout:      180 * time.Second,
-		IdleTimeout:       30 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		// 略大于 kindlegen 的 5 分钟超时，避免合法 MOBI 转换被提前切断。
+		WriteTimeout:   320 * time.Second,
+		IdleTimeout:    30 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 
 	// 后台周期清理过期产物。
@@ -269,8 +284,24 @@ func (s *Server) withRequestLog(next http.HandlerFunc) http.HandlerFunc {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next(rec, r)
-		log.Printf("%s %s %s -> %d (%s)", clientIP(r), r.Method, r.URL.Path, rec.status, time.Since(start).Round(time.Millisecond))
+		log.Printf("%s %s %s -> %d (%s)",
+			sanitizeLogField(clientIP(r)),
+			sanitizeLogField(r.Method),
+			sanitizeLogField(r.URL.Path),
+			rec.status,
+			time.Since(start).Round(time.Millisecond),
+		)
 	}
+}
+
+// sanitizeLogField 清理控制字符与换行符，防止日志注入。
+func sanitizeLogField(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 // clientIP 取来源 IP：优先 X-Forwarded-For(反代后)，否则 RemoteAddr。
@@ -326,12 +357,24 @@ type detectReq struct {
 	AddSpaceCnt int    `json:"addSpaceCount"`
 }
 
-// detectHandler 内部:解析文本返回章节标题列表。由 handleDetect 调用。
-func detectHandler(req *detectReq, text string) (map[string]interface{}, error) {
+// handleAuthCheck 供前端启动时探测令牌是否有效；鉴权逻辑由 withAuth 中间件统一执行。
+func (s *Server) handleAuthCheck(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{
+		"ok":           true,
+		"authRequired": s.cfg.Token != "",
+	})
+}
+
+// detectHandler 内部:解析文本返回章节标题列表与真实探测编码。由 handleDetect 调用。
+func detectHandler(req *detectReq, text, encoding string) (map[string]interface{}, error) {
 	opt := buildTxtOverrides(req)
 	chapters, err := txt.Parse(text, opt)
 	if err != nil {
-		return nil, fmt.Errorf("解析失败")
+		return nil, fmt.Errorf("解析失败: %w", err)
 	}
 	titles := make([]string, 0, len(chapters))
 	for _, c := range chapters {
@@ -342,11 +385,18 @@ func detectHandler(req *detectReq, text string) (map[string]interface{}, error) 
 		}
 		titles = append(titles, t)
 	}
+	count := len(titles)
+	if opt.SplitMode == 2 && count == 0 {
+		// 整本一章模式无分章标题，但正文仍为 1 章。
+		count = len(chapters)
+	}
+	if encoding == "" {
+		encoding = "UTF-8"
+	}
 	return map[string]interface{}{
-		// count 与预览目录一致：只计有标题的章。
-		"count":    len(titles),
+		"count":    count,
 		"titles":   titles,
-		"encoding": "utf-8",
+		"encoding": encoding,
 	}, nil
 }
 
@@ -356,10 +406,7 @@ func buildTxtOverrides(req *detectReq) txt.Options {
 	if splitMode < 0 || splitMode > 2 {
 		splitMode = 0
 	}
-	fullReg := req.FullReg
-	if len(fullReg) > 200 {
-		fullReg = fullReg[:200]
-	}
+	fullReg := truncateRunes(req.FullReg, 200)
 	opt := txt.Options{
 		AutoMark:          req.AutoMark,
 		RemoveBlankLine:   req.RemoveBlank,
@@ -385,12 +432,12 @@ func (s *Server) handleDetect(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	req, text, err := parseUpload(r)
+	req, text, encoding, err := parseUpload(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": safeErr(err)})
 		return
 	}
-	res, err := detectHandler(req, text)
+	res, err := detectHandler(req, text, encoding)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": safeErr(err)})
 		return
@@ -400,12 +447,13 @@ func (s *Server) handleDetect(w http.ResponseWriter, r *http.Request) {
 
 // convertReq 是 /api/convert 的排版与输出选项。
 type convertReq struct {
-	LineHeight int
-	FontSize   int
-	MarginTop  int
-	TextAlign  int
-	Indent     float64
-	EnableMobi bool
+	LineHeight   int
+	FontSize     int
+	MarginTop    int
+	MarginTopSet bool
+	TextAlign    int
+	Indent       float64
+	EnableMobi   bool
 }
 
 // handleConvert 上传 TXT 并转换,将 EPUB 写入输出目录,返回下载标识。
@@ -423,38 +471,23 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	req, text, fileName, err := parseUploadWithName(r)
+	req, text, encoding, fileName, err := parseUploadWithName(r)
 	if err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": safeErr(err)})
 		return
 	}
+	marginRaw := strings.TrimSpace(r.FormValue("marginTop"))
 	creq := &convertReq{
-		LineHeight: clampInt(atoi(r.FormValue("lineHeight")), 50, 300, 120),
-		FontSize:   clampInt(atoi(r.FormValue("fontSize")), 50, 300, 100),
-		MarginTop:  clampInt(atoi(r.FormValue("marginTop")), 0, 50, 5),
-		TextAlign:  clampInt(atoi(r.FormValue("textAlign")), 0, 3, 0),
-		Indent:     clampFloat(atof(r.FormValue("indent")), 0, 4, 0),
-		EnableMobi: parseBool(r.FormValue("enableMobi")),
+		LineHeight:   clampInt(atoi(r.FormValue("lineHeight")), 50, 300, 120),
+		FontSize:     clampInt(atoi(r.FormValue("fontSize")), 50, 300, 100),
+		MarginTop:    clampInt(atoi(marginRaw), 0, 50, 5),
+		MarginTopSet: marginRaw != "",
+		TextAlign:    clampInt(atoi(r.FormValue("textAlign")), 0, 3, 0),
+		Indent:       clampFloat(atof(r.FormValue("indent")), 0, 4, 0),
+		EnableMobi:   parseBool(r.FormValue("enableMobi")),
 	}
 
-	// 读取文件到临时输入(转换器需要文件路径)。
-	ext := filepath.Ext(fileName)
-	if !isSupportedExt(ext) {
-		ext = ".txt"
-	}
-	// 仅保留扩展名，丢弃原始文件名中的路径成分，防穿越。
-	ext = strings.ToLower(filepath.Ext(ext))
-	if ext == "" {
-		ext = ".txt"
-	}
 	base := time.Now().Format("20060102-150405") + "-" + randSuffix()
-	inPath := filepath.Join(s.outputs, base+ext)
-	if err := os.WriteFile(inPath, []byte(text), 0o644); err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "写入临时文件失败"})
-		return
-	}
-	defer os.Remove(inPath)
-
 	outPath := filepath.Join(s.outputs, base+".epub")
 	// 仅使用 WorkDir 下的 config.xml（若存在），绝不接受客户端 configPath。
 	cfgPath := ""
@@ -463,7 +496,7 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 	}
 	txtOpt := buildTxtOverrides(req)
 	co := converter.Options{
-		Input:        inPath,
+		Input:        fileName, // 仅用于书名回退，不再重复落盘读取
 		Output:       outPath,
 		Title:        req.Title,
 		Author:       req.Author,
@@ -472,16 +505,22 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 		EnableMobi:   creq.EnableMobi,
 		TXTOverrides: &txtOpt,
 		CSSOverrides: &converter.CSSOverrides{
-			LineHeight: creq.LineHeight,
-			FontSize:   creq.FontSize,
-			MarginTop:  creq.MarginTop,
-			TextAlign:  creq.TextAlign,
-			Indent:     creq.Indent,
+			LineHeight:   creq.LineHeight,
+			FontSize:     creq.FontSize,
+			MarginTop:    creq.MarginTop,
+			MarginTopSet: creq.MarginTopSet,
+			TextAlign:    creq.TextAlign,
+			Indent:       creq.Indent,
 		},
 	}
 
-	res, err := converter.Convert(co)
+	res, err := converter.ConvertText(r.Context(), co, text, encoding)
 	if err != nil {
+		var inErr *converter.InputError
+		if errors.As(err, &inErr) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": safeErr(inErr)})
+			return
+		}
 		log.Printf("convert error: %v", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "转换失败"})
 		return
@@ -491,9 +530,11 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 	epubDisplay := displayNameFromUpload(fileName, ".epub")
 	mobiName := ""
 	mobiDisplay := ""
+	mobiDownload := ""
 	if res.MobiPath != "" {
 		mobiName = filepath.Base(res.MobiPath)
 		mobiDisplay = displayNameFromUpload(fileName, ".mobi")
+		mobiDownload = "/api/download/" + mobiName + "?name=" + url.QueryEscape(mobiDisplay)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"download":     "/api/download/" + dlName + "?name=" + url.QueryEscape(epubDisplay),
@@ -501,6 +542,7 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 		"epubName":     epubDisplay,
 		"mobi":         mobiName,
 		"mobiName":     mobiDisplay,
+		"mobiDownload": mobiDownload,
 		"chapters":     res.ChapterCount,
 		"encoding":     res.Encoding,
 	})
@@ -509,6 +551,10 @@ func (s *Server) handleConvert(w http.ResponseWriter, r *http.Request) {
 // handleDownload 提供已生成文件的下载。
 // 路径段必须是服务端生成的随机名；?name= 仅影响 Content-Disposition 展示名，不参与路径解析。
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 	name := strings.TrimPrefix(r.URL.Path, "/api/download/")
 	// 白名单文件名格式 + 防目录穿越。
 	if name == "" || !downloadNameRe.MatchString(name) {
@@ -637,11 +683,7 @@ func safeErr(err error) string {
 	if err == nil {
 		return "未知错误"
 	}
-	msg := err.Error()
-	// 截断过长错误，去掉可能的盘符/绝对路径片段。
-	if len(msg) > 200 {
-		msg = msg[:200]
-	}
+	msg := truncateRunes(err.Error(), 200)
 	if strings.Contains(msg, ":\\") || strings.Contains(msg, "/") {
 		// 常见 os 错误含路径，统一脱敏。
 		if strings.Contains(msg, "解析上传") {
@@ -656,6 +698,21 @@ func safeErr(err error) string {
 		return "请求无效"
 	}
 	return msg
+}
+
+// truncateRunes 按 Unicode 字符数截断字符串，避免截断 UTF-8 多字节字符。
+func truncateRunes(s string, max int) string {
+	if max <= 0 || utf8.RuneCountInString(s) <= max {
+		return s
+	}
+	n := 0
+	for i := range s {
+		if n == max {
+			return s[:i]
+		}
+		n++
+	}
+	return s
 }
 
 func clampInt(v, min, max, def int) int {
@@ -705,14 +762,6 @@ func contentType(name string) string {
 		return "image/svg+xml"
 	}
 	return "application/octet-stream"
-}
-
-func isSupportedExt(ext string) bool {
-	switch strings.ToLower(ext) {
-	case ".txt", ".utf8", ".gbk":
-		return true
-	}
-	return false
 }
 
 func safeJoin(base, p string) bool {

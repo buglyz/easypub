@@ -71,12 +71,8 @@ func chapterHTML(b *Book, idx int) string {
 		body.WriteString(fmt.Sprintf("<p class=\"a\">%s</p>\n", p))
 	}
 	// 去掉末尾换行以与样例 </p>\n</body> 对齐。
-	s := body.String()
-	s = strings.TrimSuffix(s, "\n")
-	body.Reset()
-	body.WriteString(s)
 	title := fmt.Sprintf("chapter %d - 0", idx)
-	return fmt.Sprintf(htmlDoctype, title, body.String())
+	return fmt.Sprintf(htmlDoctype, title, strings.TrimSuffix(body.String(), "\n"))
 }
 
 // opfXML 生成 content.opf。

@@ -82,6 +82,7 @@ func TestRun_SkipExisting(t *testing.T) {
 		t.Fatalf("结果数=%d 期望 1", len(results))
 	}
 	if results[0].Err != ErrSkipped {
+		t.Errorf("期望 ErrSkipped, got %v", results[0].Err)
 	}
 	// 旧文件不应被覆盖。
 	b, _ := os.ReadFile(existing)
@@ -123,5 +124,33 @@ func TestRun_NoMatchReturnsError(t *testing.T) {
 func TestRun_MissingDirReturnsError(t *testing.T) {
 	if _, err := Run(Options{InputDir: filepath.Join(t.TempDir(), "nope")}); err == nil {
 		t.Fatal("目录不存在应返回错误")
+	}
+}
+
+func TestRun_ParallelJobsPreservesOrder(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out")
+	names := []string{"01.txt", "02.txt", "03.txt", "04.txt", "05.txt", "06.txt"}
+	for _, n := range names {
+		writeFile(t, filepath.Join(dir, n), sampleContent)
+	}
+
+	results, err := Run(Options{InputDir: dir, OutputDir: out, Jobs: 4})
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(results) != len(names) {
+		t.Fatalf("结果数=%d 期望 %d", len(results), len(names))
+	}
+	for i, r := range results {
+		if r.Err != nil {
+			t.Errorf("%s 失败: %v", r.Input, r.Err)
+		}
+		if filepath.Base(r.Input) != names[i] {
+			t.Errorf("顺序错乱: index=%d got=%s want=%s", i, filepath.Base(r.Input), names[i])
+		}
+		if _, err := os.Stat(r.Output); err != nil {
+			t.Errorf("输出缺失 %s: %v", r.Output, err)
+		}
 	}
 }

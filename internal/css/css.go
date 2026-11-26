@@ -112,7 +112,7 @@ func Generate(o Options) string {
 	// .a 段落正文样式
 	indent := "0em"
 	if o.Indent > 0 {
-		indent = fmt.Sprintf("%grem", o.Indent)
+		indent = fmt.Sprintf("%gem", o.Indent)
 	}
 	b.WriteString(".a { \n")
 	b.WriteString(fmt.Sprintf("      text-indent: %s;\n", indent))

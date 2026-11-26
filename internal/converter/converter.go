@@ -3,6 +3,7 @@
 package converter
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,15 @@ import (
 	"github.com/easypub/go-easypub/internal/mobi"
 	"github.com/easypub/go-easypub/internal/txt"
 )
+
+// InputError 表示用户输入参数/正则/编码等问题导致的错误，
+// 供上层（如 WebUI）与服务端内部错误区分（HTTP 400 vs 500）。
+type InputError struct {
+	Err error
+}
+
+func (e *InputError) Error() string { return e.Err.Error() }
+func (e *InputError) Unwrap() error { return e.Err }
 
 // Options 描述一次转换所需的所有输入。
 type Options struct {
@@ -42,13 +52,14 @@ type Options struct {
 	BaseDir string
 }
 
-// CSSOverrides 覆盖 CSS 排版参数(零值表示不使用该覆盖)。
+// CSSOverrides 覆盖 CSS 排版参数(零值表示不使用该覆盖；MarginTop 为 0 时可配合 MarginTopSet=true 显式生效)。
 type CSSOverrides struct {
-	LineHeight int
-	FontSize   int
-	MarginTop  int
-	TextAlign  int // 0=justify 1=left 2=center 3=right
-	Indent     float64
+	LineHeight   int
+	FontSize     int
+	MarginTop    int
+	MarginTopSet bool
+	TextAlign    int // 0=justify 1=left 2=center 3=right
+	Indent       float64
 }
 
 // Result 描述一次转换的产物。
@@ -62,14 +73,47 @@ type Result struct {
 
 // Convert 执行完整转换，返回产物信息。
 func Convert(opt Options) (*Result, error) {
+	return ConvertContext(context.Background(), opt)
+}
+
+// ConvertContext 同 Convert，但支持通过 ctx 取消（如取消耗时 mobi 转换或批量任务）。
+func ConvertContext(ctx context.Context, opt Options) (*Result, error) {
 	if !fileExists(opt.Input) {
-		return nil, fmt.Errorf("输入文件不存在: %s", opt.Input)
+		return nil, &InputError{Err: fmt.Errorf("输入文件不存在: %s", opt.Input)}
 	}
 
 	outPath := opt.Output
 	if outPath == "" {
 		ext := filepath.Ext(opt.Input)
 		outPath = strings.TrimSuffix(opt.Input, ext) + ".epub"
+	}
+
+	// 解析 TXT。
+	text, enc, err := txt.ReadFileEncoded(opt.Input)
+	if err != nil {
+		return nil, &InputError{Err: fmt.Errorf("读取 TXT 失败: %w", err)}
+	}
+	return convertContent(ctx, opt, text, enc, outPath)
+}
+
+// ConvertText 直接使用已解码的文本与编码名称执行转换，避免 WebUI 场景重复落盘与重读。
+// opt.Output 必须非空；opt.Input 仅作书名推断回退，不要求磁盘存在。
+func ConvertText(ctx context.Context, opt Options, text, encoding string) (*Result, error) {
+	if opt.Output == "" {
+		return nil, &InputError{Err: fmt.Errorf("输出路径不能为空")}
+	}
+	if encoding == "" {
+		encoding = "UTF-8"
+	}
+	return convertContent(ctx, opt, text, encoding, opt.Output)
+}
+
+func convertContent(ctx context.Context, opt Options, text, enc, outPath string) (*Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// 配置与基准目录。
@@ -86,7 +130,7 @@ func Convert(opt Options) (*Result, error) {
 		}
 		cfg = c
 		cfgDir = filepath.Dir(opt.ConfigPath)
-	} else {
+	} else if baseDir != "" {
 		// 仅从 baseDir 探测，避免依赖 CWD 的隐式命中。
 		cand := filepath.Join(baseDir, "config.xml")
 		if fileExists(cand) {
@@ -99,19 +143,17 @@ func Convert(opt Options) (*Result, error) {
 		}
 	}
 
-	// 解析 TXT。
-	text, enc, err := txt.ReadFileEncoded(opt.Input)
-	if err != nil {
-		return nil, fmt.Errorf("读取 TXT 失败: %w", err)
-	}
-
 	txtOpt := buildTxtOptions(cfg)
 	if opt.TXTOverrides != nil {
 		txtOpt = mergeTxtOptions(txtOpt, *opt.TXTOverrides)
 	}
 	chapters, err := txt.Parse(text, txtOpt)
 	if err != nil {
-		return nil, fmt.Errorf("解析 TXT 失败: %w", err)
+		return nil, &InputError{Err: fmt.Errorf("解析 TXT 失败: %w", err)}
+	}
+
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 
 	// 书名。
@@ -157,7 +199,7 @@ func Convert(opt Options) (*Result, error) {
 	if opt.EnableMobi {
 		mobiOpt := buildMobiOptions(cfg)
 		mobiOpt.Quiet = opt.Quiet
-		mobiPath, merr := mobi.Convert(mobiOpt, baseDir, outPath)
+		mobiPath, merr := mobi.ConvertContext(ctx, mobiOpt, baseDir, outPath)
 		if merr != nil {
 			return res, fmt.Errorf("EPUB 已生成但 MOBI 失败: %w", merr)
 		}
@@ -250,7 +292,7 @@ func applyCSSOverrideValues(o *css.Options, c CSSOverrides) {
 	if c.FontSize > 0 {
 		o.FontSize = c.FontSize
 	}
-	if c.MarginTop > 0 {
+	if c.MarginTop > 0 || (c.MarginTopSet && c.MarginTop >= 0) {
 		o.MarginTop = c.MarginTop
 	}
 	if c.TextAlign >= 0 && c.TextAlign <= 3 {
@@ -318,8 +360,18 @@ func resolveFontSrcs(cfg *config.Root, cfgDir, erPath string, fontIdx int) []str
 
 func inferTitle(text, path string) string {
 	// 只识别明确的书名前缀，避免把 "作者：x" / "Chapter 1: The Beginning" 误切为书名。
+	// 按行流式查找首个非空行，避免对大文件 strings.Split 分配几十万个切片元素。
 	prefixes := []string{"书名：", "书名:", "题目：", "题目:", "Title:", "Title：", "TITLE:", "TITLE："}
-	for _, line := range strings.Split(text, "\n") {
+	rest := text
+	for len(rest) > 0 {
+		var line string
+		if idx := strings.IndexByte(rest, '\n'); idx >= 0 {
+			line = rest[:idx]
+			rest = rest[idx+1:]
+		} else {
+			line = rest
+			rest = ""
+		}
 		t := strings.TrimSpace(line)
 		if t == "" {
 			continue

@@ -21,6 +21,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"time"
 
 	"github.com/easypub/go-easypub/internal/batch"
@@ -112,6 +113,7 @@ func run() error {
 		fontIdx     = flag.Int("font", -1, "ereaders.xml 中阅读器字体方案索引(从 0 开始,-1=用第一个)")
 		enableMobi  = flag.Bool("mobi", false, "同时输出 MOBI(调用本机 kindlegen)")
 		skipExist   = flag.Bool("skip-existing", false, "批量模式:目标 EPUB 已存在时跳过该文件(幂等)")
+		jobs        = flag.Int("j", 1, "批量模式:并发转换数(0=按 CPU 核数,默认 1)")
 		quiet       = flag.Bool("quiet", false, "静默模式:不打印进度")
 		showVersion = flag.Bool("version", false, "打印版本并退出")
 	)
@@ -131,10 +133,14 @@ func run() error {
 		return fmt.Errorf("输入不存在: %w", err)
 	}
 	if info.IsDir() {
+		workers := *jobs
+		if workers == 0 {
+			workers = runtime.NumCPU()
+		}
 		return runBatch(batchOptions{
 			Input: *input, Output: *output, Title: *title, Author: *author,
 			ConfigPath: *configP, EReadersPath: *ereaders, FontIndex: *fontIdx,
-			EnableMobi: *enableMobi, SkipExisting: *skipExist, Quiet: *quiet,
+			EnableMobi: *enableMobi, SkipExisting: *skipExist, Quiet: *quiet, Jobs: workers,
 		})
 	}
 
@@ -163,14 +169,15 @@ func run() error {
 
 // batchOptions 是 runBatch 的参数聚合。
 type batchOptions struct {
-	Input, Output   string
-	Title, Author   string
-	ConfigPath      string
-	EReadersPath    string
-	FontIndex       int
-	EnableMobi      bool
-	SkipExisting    bool
-	Quiet           bool
+	Input, Output string
+	Title, Author string
+	ConfigPath    string
+	EReadersPath  string
+	FontIndex     int
+	EnableMobi    bool
+	SkipExisting  bool
+	Quiet         bool
+	Jobs          int
 }
 
 // runBatch 将目录内全部 TXT 转换为 EPUB。
@@ -186,6 +193,7 @@ func runBatch(o batchOptions) error {
 		EnableMobi:   o.EnableMobi,
 		Quiet:        o.Quiet,
 		SkipExisting: o.SkipExisting,
+		Jobs:         o.Jobs,
 	})
 	if err != nil {
 		return err

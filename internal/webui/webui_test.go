@@ -1,7 +1,10 @@
 package webui
 
 import (
+	"archive/zip"
 	"bytes"
+	"encoding/json"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +14,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -129,12 +135,151 @@ func TestDetect_SplitByCount(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	if !strings.Contains(rec.Body.String(), `"count"`) {
-		t.Fatalf("response 缺 count: %s", rec.Body.String())
+	var resp struct {
+		Count    int      `json:"count"`
+		Titles   []string `json:"titles"`
+		Encoding string   `json:"encoding"`
 	}
-	// 按字数应切出多于 1 章。
-	if strings.Contains(rec.Body.String(), `"count":1,`) || strings.Contains(rec.Body.String(), `"count": 1`) {
-		t.Fatalf("按字数分章应 >1 章: %s", rec.Body.String())
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal: %v body=%s", err, rec.Body.String())
+	}
+	// 按字数应切出多于 1 章，且每章均带标题供目录预览。
+	if resp.Count <= 1 || len(resp.Titles) != resp.Count {
+		t.Fatalf("按字数分章应 >1 章且有标题: %+v", resp)
+	}
+}
+
+func TestDetect_WholeBookModeReturnsCountOne(t *testing.T) {
+	s := newTestServer(t)
+	body, ct := buildMultipart(t, map[string]string{
+		"splitMode":   "2",
+		"autoMark":    "false",
+		"removeBlank": "true",
+	}, "file", "book.txt", "第1章 开端\n正文内容。\n")
+	req := httptest.NewRequest(http.MethodPost, "/api/detect", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	s.handleDetect(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Count  int      `json:"count"`
+		Titles []string `json:"titles"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	if resp.Count != 1 {
+		t.Fatalf("整本一章应返回 count=1, got %+v", resp)
+	}
+}
+
+func TestDetectAndConvert_PreservesGBKEncodingAndMarginTopZero(t *testing.T) {
+	s := newTestServer(t)
+	gbkBytes, err := simplifiedchinese.GBK.NewEncoder().Bytes([]byte("第1章 开端\n　　简体中文正文。\n"))
+	if err != nil {
+		t.Fatalf("GBK encode: %v", err)
+	}
+	// 1. /api/detect 应返回真实编码 GBK。
+	body, ct := buildMultipart(t, map[string]string{
+		"splitMode": "0", "autoMark": "true", "removeBlank": "true",
+	}, "file", "gbk.txt", string(gbkBytes))
+	req := httptest.NewRequest(http.MethodPost, "/api/detect", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	s.handleDetect(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("detect status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var detectResp struct {
+		Encoding string `json:"encoding"`
+		Count    int    `json:"count"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &detectResp); err != nil {
+		t.Fatal(err)
+	}
+	if detectResp.Encoding != "GBK" {
+		t.Errorf("detect encoding=%q, 期望 GBK", detectResp.Encoding)
+	}
+
+	// 2. /api/convert 应返回真实编码 GBK 且 marginTop=0 生效。
+	body2, ct2 := buildMultipart(t, map[string]string{
+		"splitMode": "0", "autoMark": "true", "removeBlank": "true",
+		"lineHeight": "120", "fontSize": "100", "marginTop": "0", "textAlign": "0", "indent": "2",
+	}, "file", "gbk.txt", string(gbkBytes))
+	req2 := httptest.NewRequest(http.MethodPost, "/api/convert", body2)
+	req2.Header.Set("Content-Type", ct2)
+	rec2 := httptest.NewRecorder()
+	s.handleConvert(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("convert status=%d body=%s", rec2.Code, rec2.Body.String())
+	}
+	var convResp struct {
+		Epub     string `json:"epub"`
+		Encoding string `json:"encoding"`
+	}
+	if err := json.Unmarshal(rec2.Body.Bytes(), &convResp); err != nil {
+		t.Fatal(err)
+	}
+	if convResp.Encoding != "GBK" {
+		t.Errorf("convert encoding=%q, 期望 GBK", convResp.Encoding)
+	}
+	r, err := zip.OpenReader(filepath.Join(s.outputs, convResp.Epub))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	for _, f := range r.File {
+		if f.Name == "OEBPS/style.css" {
+			rc, _ := f.Open()
+			b, _ := io.ReadAll(rc)
+			rc.Close()
+			if !strings.Contains(string(b), "margin-top: 0px;") {
+				t.Errorf("marginTop=0 未写入 style.css: %s", string(b))
+			}
+			if !strings.Contains(string(b), "text-indent: 2em;") {
+				t.Errorf("indent=2 应为 2em: %s", string(b))
+			}
+		}
+	}
+}
+
+func TestConvert_InvalidRegexReturns400(t *testing.T) {
+	s := newTestServer(t)
+	body, ct := buildMultipart(t, map[string]string{
+		"splitMode": "0", "autoMark": "false", "fullReg": "[invalid",
+	}, "file", "book.txt", "正文\n")
+	req := httptest.NewRequest(http.MethodPost, "/api/convert", body)
+	req.Header.Set("Content-Type", ct)
+	rec := httptest.NewRecorder()
+	s.handleConvert(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("非法正则期望 400, got %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "正则") {
+		t.Errorf("错误文案应提示正则错误, got %s", rec.Body.String())
+	}
+}
+
+func TestDownload_RejectsNonGetHead(t *testing.T) {
+	s := newTestServer(t)
+	req := httptest.NewRequest(http.MethodPost, "/api/download/20240101-000000-deadbeef.epub", nil)
+	rec := httptest.NewRecorder()
+	s.handleDownload(rec, req)
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("POST 下载期望 405, got %d", rec.Code)
+	}
+}
+
+func TestTruncateRunesAndSanitizeLogField(t *testing.T) {
+	s := strings.Repeat("中", 250)
+	got := truncateRunes(s, 200)
+	if !utf8.ValidString(got) || utf8.RuneCountInString(got) != 200 {
+		t.Errorf("UTF-8 截断异常: valid=%v runes=%d", utf8.ValidString(got), utf8.RuneCountInString(got))
+	}
+	if clean := sanitizeLogField("1.2.3.4\r\nFAKE"); strings.ContainsAny(clean, "\r\n") {
+		t.Errorf("日志字段不应含换行符: %q", clean)
 	}
 }
 
@@ -412,20 +557,6 @@ func TestCleanupOnce_RemovesExpiredFiles(t *testing.T) {
 
 // ---- 令牌鉴权 ----
 
-// buildAuthMux 复刻 Run() 的中间件链(请求日志/安全头/鉴权)，用于走完整链路测试。
-func buildAuthMux(s *Server) *http.ServeMux {
-	mux := http.NewServeMux()
-	protected := func(h http.HandlerFunc) http.HandlerFunc {
-		return s.withRequestLog(s.withSecurityHeaders(s.withAuth(h)))
-	}
-	mux.HandleFunc("/", protected(s.handleIndex))
-	mux.HandleFunc("/api/detect", protected(s.handleDetect))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
-	return mux
-}
-
 func newAuthTestServer(t *testing.T, token string) (*Server, *httptest.Server) {
 	t.Helper()
 	dir := t.TempDir()
@@ -433,18 +564,34 @@ func newAuthTestServer(t *testing.T, token string) (*Server, *httptest.Server) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	srv := httptest.NewServer(buildAuthMux(s))
+	srv := httptest.NewServer(s.Handler())
 	t.Cleanup(srv.Close)
 	return s, srv
 }
 
+func TestAuth_StaticShellAccessibleWithoutToken(t *testing.T) {
+	// 启用 -token 时，前端页面与静态资源必须可加载，否则弹窗永远无法出现（防鉴权死锁）。
+	_, srv := newAuthTestServer(t, "secret-token")
+	for _, path := range []string{"/", "/style.css", "/app.js"} {
+		resp, err := http.Get(srv.URL + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("静态壳 %s 应放行返回 200, got %d", path, resp.StatusCode)
+		}
+	}
+}
+
 func TestAuth_RejectsMissingOrWrongToken(t *testing.T) {
 	_, srv := newAuthTestServer(t, "secret-token")
+	authURL := srv.URL + "/api/auth"
 
 	for name, req := range map[string]*http.Request{
-		"无令牌":      mustNewRequest(t, http.MethodGet, srv.URL),
-		"错误令牌":    withAuthHeader(mustNewRequest(t, http.MethodGet, srv.URL), "wrong"),
-		"Bearer 错误": withBearer(mustNewRequest(t, http.MethodGet, srv.URL), "wrong"),
+		"无令牌":       mustNewRequest(t, http.MethodGet, authURL),
+		"错误令牌":      withAuthHeader(mustNewRequest(t, http.MethodGet, authURL), "wrong"),
+		"Bearer 错误": withBearer(mustNewRequest(t, http.MethodGet, authURL), "wrong"),
 	} {
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
@@ -459,14 +606,15 @@ func TestAuth_RejectsMissingOrWrongToken(t *testing.T) {
 
 func TestAuth_AcceptsToken(t *testing.T) {
 	_, srv := newAuthTestServer(t, "secret-token")
+	authURL := srv.URL + "/api/auth"
 
 	cases := []struct {
 		name string
 		req  *http.Request
 	}{
-		{"X-Auth-Token 头", withAuthHeader(mustNewRequest(t, http.MethodGet, srv.URL), "secret-token")},
-		{"Authorization Bearer", withBearer(mustNewRequest(t, http.MethodGet, srv.URL), "secret-token")},
-		{"?token= 查询参数", mustNewRequest(t, http.MethodGet, srv.URL+"?token=secret-token")},
+		{"X-Auth-Token 头", withAuthHeader(mustNewRequest(t, http.MethodGet, authURL), "secret-token")},
+		{"Authorization Bearer", withBearer(mustNewRequest(t, http.MethodGet, authURL), "secret-token")},
+		{"?token= 查询参数", mustNewRequest(t, http.MethodGet, authURL+"?token=secret-token")},
 	}
 	for _, c := range cases {
 		resp, err := http.DefaultClient.Do(c.req)
@@ -494,9 +642,9 @@ func TestAuth_HealthzExempt(t *testing.T) {
 
 func TestAuth_DisabledWhenTokenEmpty(t *testing.T) {
 	_, srv := newAuthTestServer(t, "")
-	resp, err := http.Get(srv.URL)
+	resp, err := http.Get(srv.URL + "/api/auth")
 	if err != nil {
-		t.Fatalf("GET /: %v", err)
+		t.Fatalf("GET /api/auth: %v", err)
 	}
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -504,7 +652,7 @@ func TestAuth_DisabledWhenTokenEmpty(t *testing.T) {
 	}
 }
 
-func TestAuth_ApiDetectProtected(t *testing.T) {
+func TestAuth_ApiDetectAndDownloadProtected(t *testing.T) {
 	_, srv := newAuthTestServer(t, "secret-token")
 	// 无令牌访问 /api/detect 应 401。
 	resp, err := http.Post(srv.URL+"/api/detect", "application/octet-stream", bytes.NewReader(nil))
@@ -514,6 +662,15 @@ func TestAuth_ApiDetectProtected(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("/api/detect 无令牌应 401, got %d", resp.StatusCode)
+	}
+	// 无令牌访问 /api/download/ 应 401。
+	resp2, err := http.Get(srv.URL + "/api/download/20240101-000000-deadbeef.epub")
+	if err != nil {
+		t.Fatalf("GET /api/download: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusUnauthorized {
+		t.Errorf("/api/download 无令牌应 401, got %d", resp2.StatusCode)
 	}
 }
 

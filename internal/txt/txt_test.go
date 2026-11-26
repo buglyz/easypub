@@ -143,6 +143,23 @@ func TestBuildSimplePattern(t *testing.T) {
 			t.Errorf("MatchString(%q)=%v,期望 %v", c.line, got, c.want)
 		}
 	}
+
+	// SimpleRegLeadingSpace=false 时不应匹配带前导空格的行。
+	strict, err := buildSimplePattern(Options{
+		SimpleRegP1:           "[第卷]",
+		SimpleRegP2:           0,
+		SimpleRegP3:           "[章回卷节集部]",
+		SimpleRegLeadingSpace: false,
+	})
+	if err != nil {
+		t.Fatalf("buildSimplePattern(strict): %v", err)
+	}
+	if !strict.MatchString("第1章 开端") {
+		t.Error("无前导空格应匹配")
+	}
+	if strict.MatchString("  第1章 开端") {
+		t.Error("SimpleRegLeadingSpace=false 不应匹配前导空格")
+	}
 }
 
 func TestParse_CNumerals(t *testing.T) {
@@ -207,6 +224,11 @@ func TestParse_SplitByCount(t *testing.T) {
 	}
 	if len(chs) < 2 {
 		t.Fatalf("按字数切期望 >=2 章,得到 %d", len(chs))
+	}
+	for i, c := range chs {
+		if c.Title == "" {
+			t.Errorf("按字数分章第 %d 章应有默认标题", i)
+		}
 	}
 }
 

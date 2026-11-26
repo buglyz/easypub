@@ -109,6 +109,7 @@ make darwin   # 仅 macOS
 | `--font` | 0 (-1=用第一个) | ereaders.xml 中阅读器字体方案索引 |
 | `--mobi` | false | 同时调用 `kindlegen` 生成 MOBI |
 | `--skip-existing` | false | 批量模式：目标 EPUB 已存在时跳过（幂等） |
+| `-j` | 1 | 批量模式：并发转换数（`0` 按 CPU 核数） |
 | `--quiet` | false | 静默模式 |
 | `-version` | | 打印版本 |
 ## WebUI 用法
@@ -124,7 +125,7 @@ make darwin   # 仅 macOS
 |---|---|---|
 | `-addr` | `127.0.0.1:8080` | 监听地址；默认仅本机。公网/局域网请显式指定并注意无鉴权风险 |
 | `-dir`  | 当前工作目录 | 工作目录，用于查找 `config.xml`/`ereaders.xml`，也是默认输出目录 |
-| `-token` | 空（不鉴权） | 访问令牌；非空时除 `/healthz` 外所有端点要求令牌（`X-Auth-Token` 头 / `Authorization: Bearer <token>` / `?token=`），也支持环境变量 `EASYPUB_TOKEN` |
+| `-token` | 空（不鉴权） | 访问令牌；非空时所有 `/api/*` 端点要求令牌（`X-Auth-Token` 头 / `Authorization: Bearer <token>` / `?token=`），前端静态壳正常加载并在启动时检测弹窗，`/healthz` 免鉴权；也支持环境变量 `EASYPUB_TOKEN` |
 
 > 启用令牌后前端会在收到 401 时弹出令牌输入框，记住后自动带上；下载链接自动追加 `?token=`。
 WebUI 流程：
